@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+.qa-venv/
+dist/
+build/
+*.egg-info/
+
+# Node
+node_modules/
+apps/web/dist/
+coverage/
+*.tsbuildinfo
+apps/web/vite.config.js
+apps/web/vite.config.d.ts
+
+# Runtime data and secrets
+.env
+.env.*
+!.env.example
+data/raw/
+data/cache/
+data/runtime/
+data/research/
+data/audit/
+backups/
+*.db
+*.sqlite*
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

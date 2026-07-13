@@ -1,0 +1,36 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      QUANT_DATA_PROVIDER: akshare
+      QUANT_AKSHARE_SYMBOLS: ${QUANT_AKSHARE_SYMBOLS:-600519.SH,000858.SZ,000333.SZ,601318.SH,600036.SH,601166.SH,000651.SZ,600276.SH,300760.SZ,300750.SZ,002594.SZ,601012.SH,600900.SH,601088.SH,600028.SH,601857.SH,600030.SH,000001.SZ,002415.SZ,000725.SZ,002230.SZ,603986.SH,000977.SZ,300308.SZ,688981.SH,600309.SH,601899.SH,600887.SH,600809.SH,002475.SZ}
+      QUANT_AKSHARE_MIN_REQUEST_INTERVAL_SECONDS: ${QUANT_AKSHARE_MIN_REQUEST_INTERVAL_SECONDS:-0.75}
+      QUANT_DB_PATH: /app/data/quant_system.db
+      QUANT_RESEARCH_PATH: /app/data/research
+    volumes:
+      - quant-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  web:
+    build:
+      context: apps/web
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${HTTP_PORT:-80}:80"
+
+volumes:
+  quant-data:
+

@@ -1,0 +1,29 @@
+{
+  "name": "a-share-swing-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -b && vite build",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "react-router-dom": "latest",
+    "typescript": "latest",
+    "vite": "latest"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "latest",
+    "@testing-library/react": "latest",
+    "@types/node": "^26.1.0",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
+    "axe-core": "^4.12.1",
+    "jsdom": "latest",
+    "vitest": "latest"
+  }
+}

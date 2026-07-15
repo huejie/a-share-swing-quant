@@ -1,0 +1,13 @@
+[Unit]
+Description=Run A-share observation after weekday market close
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 18:35:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=120
+AccuracySec=1min
+Unit=a-share-quant-eod.service
+
+[Install]
+WantedBy=timers.target
+

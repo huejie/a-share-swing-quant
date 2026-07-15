@@ -1,0 +1,11 @@
+[Unit]
+Description=A-share swing quant weekday EOD observation
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/curl --fail --silent --show-error --max-time 360 --output /dev/null --write-out status=%%{http_code}\n --header Content-Type:application/json --data {} http://127.0.0.1/api/v1/pipeline/eod
+Restart=on-failure
+RestartSec=300
+

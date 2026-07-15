@@ -102,5 +102,6 @@ $backup = .\scripts\backup.ps1 -DestinationRoot D:\safe-backups
 - `docs/ARCHITECTURE.md`：模块边界与 API 契约；
 - `docs/ACCEPTANCE.md`：验收矩阵；
 - `docs/RUNBOOK.md`：日终、过期、故障、备份与恢复操作。
+- `docs/DEPLOYMENT.md`：当前服务器部署、更新、定时任务与回滚记录。
 
 本产品仅供研究与决策辅助，不构成收益保证，不连接券商，不自动交易。

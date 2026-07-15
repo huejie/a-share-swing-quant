@@ -69,10 +69,9 @@ def test_adjustment_factor_removes_false_corporate_action_return_and_keeps_lates
     assert history[-1].close==50
     assert history[0].close==50
     assert _return(history,60)==0
-    signal,zone=entry_signal(history)
-    assert signal in {"平台突破","趋势回踩"}
-    assert 48<=zone[0]<=51
-    assert 49<=zone[1]<=52
+    # Corporate-action normalization must not manufacture a signal.  This
+    # fixture is deliberately flat and lacks breakout/pullback confirmation.
+    assert entry_signal(history) is None
 
 
 def test_profit_giveback_stop_activates_only_after_15_percent():

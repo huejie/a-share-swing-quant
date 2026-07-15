@@ -27,6 +27,7 @@ async function renderRoute(path:string){
  vi.stubGlobal('fetch',vi.fn().mockRejectedValue(new Error('offline')));
  render(<MemoryRouter initialEntries={[path]}><App/></MemoryRouter>);
  await screen.findAllByText('演示数据');
+ if(path==='/settings')await waitFor(()=>expect(screen.getByRole('button',{name:'保存设置'})).not.toBeDisabled());
 }
 
 describe('整页自动化可访问性',()=>{

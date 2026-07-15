@@ -12,6 +12,7 @@ from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from hashlib import sha256
 import json
+from math import isfinite
 from pathlib import Path
 from statistics import median
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -64,6 +65,18 @@ class TimeSeriesSplit:
     dates_hash: str
 
 
+@dataclass(frozen=True)
+class ResearchInputScope:
+    purpose: str
+    start: str
+    end: str
+    observations: int
+    dates_hash: str
+    final_test_start: str
+    overlaps_final_test: bool
+    source_metadata_forwarded: tuple[str, ...]
+
+
 def make_time_series_split(
     dates: Iterable[date | str], train_ratio: float = .6, validation_ratio: float = .2,
     embargo_observations: int = 0,
@@ -97,6 +110,35 @@ def make_time_series_split(
     )
 
 
+def make_parameter_selection_snapshot(
+    snapshot: DataSnapshot, split: TimeSeriesSplit,
+) -> tuple[DataSnapshot, ResearchInputScope]:
+    """Build an input that cannot expose final-test bars or full-snapshot metadata."""
+    validation = next(window for window in split.windows if window.name == "validation")
+    final_test = next(window for window in split.windows if window.name == "final_test")
+    validation_end = date.fromisoformat(validation.end)
+    bars = [bar for bar in snapshot.bars if bar.day <= validation_end]
+    dates = sorted({bar.day.isoformat() for bar in bars})
+    if not dates:
+        raise ValueError("parameter-selection snapshot has no observations")
+    if any(day >= final_test.start for day in dates):
+        raise ValueError("parameter-selection snapshot overlaps final test")
+    scope = ResearchInputScope(
+        purpose="parameter_selection_sensitivity_ablation",
+        start=dates[0], end=dates[-1], observations=len(dates),
+        dates_hash=content_hash(dates), final_test_start=final_test.start,
+        overlaps_final_test=False, source_metadata_forwarded=(),
+    )
+    restricted = DataSnapshot(
+        datetime.combine(validation_end, snapshot.as_of.timetz()), bars,
+        snapshot.provider, snapshot.expected_symbols,
+        {"research_scope": _jsonable(scope)},
+    )
+    if restricted.as_of.date().isoformat() >= final_test.start:
+        raise ValueError("parameter-selection as_of overlaps final test")
+    return restricted, scope
+
+
 @dataclass(frozen=True)
 class BaselineResult:
     name: str
@@ -105,6 +147,17 @@ class BaselineResult:
     observations: int
     source: str
     is_official_point_in_time: bool
+
+
+@dataclass(frozen=True)
+class BaselineContractEvaluation:
+    status: str
+    schema_version: str | None
+    required_dates: tuple[str, ...]
+    missing_series: tuple[str, ...]
+    missing_dates: dict[str, tuple[str, ...]]
+    errors: tuple[str, ...]
+    results: tuple[BaselineResult, ...]
 
 
 def _curve_metrics(returns: Sequence[float]) -> tuple[float, float]:
@@ -131,6 +184,90 @@ def evaluate_baselines(
         total, mdd = _curve_metrics(values)
         results.append(BaselineResult(name, total, mdd, len(values), sources.get(name, "unspecified"), bool(official_point_in_time.get(name, False))))
     return tuple(results)
+
+
+def evaluate_baseline_contract(
+    metadata: Mapping[str, Any], required_dates: Sequence[str],
+) -> BaselineContractEvaluation:
+    """Evaluate only explicit, source-labelled, date-aligned baseline series.
+
+    ``metadata.research_baselines`` must use ``research-baselines/v1`` and
+    provide ``returns_by_date`` for every final-test return date.  There is no
+    market-return or strategy-return fallback.
+    """
+    required = tuple(dict.fromkeys(str(day) for day in required_dates))
+    contract = metadata.get("research_baselines") if isinstance(metadata, Mapping) else None
+    if not isinstance(contract, Mapping):
+        return BaselineContractEvaluation(
+            "missing", None, required, REQUIRED_BASELINES, {},
+            ("snapshot.metadata.research_baselines is missing",), (),
+        )
+    schema = contract.get("schema_version")
+    if schema != "research-baselines/v1":
+        return BaselineContractEvaluation(
+            "invalid", str(schema) if schema is not None else None, required,
+            REQUIRED_BASELINES, {},
+            ("baseline contract schema_version must be research-baselines/v1",), (),
+        )
+    series = contract.get("series")
+    if not isinstance(series, Mapping):
+        return BaselineContractEvaluation(
+            "invalid", str(schema), required, REQUIRED_BASELINES, {},
+            ("baseline contract series must be a mapping",), (),
+        )
+    missing_series = tuple(name for name in REQUIRED_BASELINES if name not in series)
+    missing_dates: dict[str, tuple[str, ...]] = {}
+    errors: list[str] = []
+    prepared: dict[str, list[float]] = {}
+    sources: dict[str, str] = {}
+    official: dict[str, bool] = {}
+    for name in REQUIRED_BASELINES:
+        item = series.get(name)
+        if item is None:
+            continue
+        if not isinstance(item, Mapping):
+            errors.append(f"baseline {name} must be a mapping")
+            continue
+        source = item.get("source")
+        returns_by_date = item.get("returns_by_date")
+        if not isinstance(source, str) or not source.strip():
+            errors.append(f"baseline {name} source is missing")
+        if not isinstance(returns_by_date, Mapping):
+            errors.append(f"baseline {name} returns_by_date must be a mapping")
+            continue
+        absent = tuple(day for day in required if day not in returns_by_date)
+        if absent:
+            missing_dates[name] = absent
+            continue
+        values: list[float] = []
+        for day in required:
+            try:
+                value = float(returns_by_date[day])
+            except (TypeError, ValueError):
+                errors.append(f"baseline {name} has a non-numeric return on {day}")
+                break
+            if not isfinite(value) or value <= -1:
+                errors.append(f"baseline {name} has an invalid return on {day}")
+                break
+            values.append(value)
+        else:
+            prepared[name] = values
+            sources[name] = source.strip() if isinstance(source, str) else ""
+            official[name] = bool(item.get("is_official_point_in_time", False))
+    if missing_series or missing_dates:
+        return BaselineContractEvaluation(
+            "missing", str(schema), required, missing_series, missing_dates,
+            tuple(errors), (),
+        )
+    if errors or len(prepared) != len(REQUIRED_BASELINES):
+        return BaselineContractEvaluation(
+            "invalid", str(schema), required, missing_series, missing_dates,
+            tuple(errors or ["baseline contract could not be evaluated"]), (),
+        )
+    return BaselineContractEvaluation(
+        "available", str(schema), required, (), {}, (),
+        evaluate_baselines(prepared, sources, official),
+    )
 
 
 @dataclass(frozen=True)
@@ -230,7 +367,7 @@ class GateInput:
     oos_max_drawdown: float
     average_holdings: float
     median_holding_days: float
-    after_cost_excess_return: float
+    after_cost_excess_return: float | None
     max_year_contribution: float
     max_theme_contribution: float
     max_stock_contribution: float
@@ -260,12 +397,15 @@ def evaluate_gates(metrics: GateInput) -> dict[str, Any]:
         gate("BT-008-DRAWDOWN-HARD", metrics.oos_max_drawdown >= -.18, metrics.oos_max_drawdown, "样本外最大回撤不得超过18%"),
         gate("BT-008-HOLDINGS", 3 <= metrics.average_holdings <= 5, metrics.average_holdings, "平均持仓3至5只"),
         gate("BT-008-HOLDING-DAYS", 40 <= metrics.median_holding_days <= 80, metrics.median_holding_days, "持仓中位数40至80个交易日"),
-        gate("BT-008-EXCESS", metrics.after_cost_excess_return > 0, metrics.after_cost_excess_return, "扣费后样本外超额收益为正"),
+        gate("BT-008-EXCESS", metrics.after_cost_excess_return is not None and metrics.after_cost_excess_return > 0,
+             metrics.after_cost_excess_return, "扣费后样本外超额收益为正",
+             "缺少显式中证全指基线，无法计算超额收益" if metrics.after_cost_excess_return is None else ""),
         gate("BT-008-CONCENTRATION", max(metrics.max_year_contribution, metrics.max_theme_contribution, metrics.max_stock_contribution) <= .50,
              {"year": metrics.max_year_contribution, "theme": metrics.max_theme_contribution, "stock": metrics.max_stock_contribution}, "单一年份、题材或股票贡献均不超过50%"),
         gate("BT-008-STABILITY", metrics.neighbor_stability_ratio >= .67, metrics.neighbor_stability_ratio, "至少三分之二邻近参数保持稳定"),
         gate("BT-005-FINAL-TEST", metrics.final_test_isolated, metrics.final_test_isolated, "最终测试集未参与调参"),
-        gate("BT-006-BASELINES", metrics.baseline_count >= 3, metrics.baseline_count, "沪深300、中证全指、简单动量三基线"),
+        gate("BT-006-BASELINES", metrics.baseline_count >= 3, metrics.baseline_count, "沪深300、中证全指、简单动量三基线",
+             "快照缺少完整、逐日对齐的显式基线序列" if metrics.baseline_count < 3 else ""),
         gate("BT-007-CAPACITY", metrics.capacity_tier_count == 4, metrics.capacity_tier_count, "10万、100万、300万、1000万四档容量"),
         gate("DAT-PIT", metrics.point_in_time_verified, metrics.point_in_time_verified, "真实数据通过PIT与历史成分验证", "Demo不能证明此项"),
         gate("DATA-LICENSE", metrics.production_data_authorized, metrics.production_data_authorized, "生产数据授权已书面确认"),

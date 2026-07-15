@@ -122,6 +122,27 @@ $env:QUANT_TUSHARE_MIN_REQUEST_INTERVAL_SECONDS = "1.25"
 5. 产出 `manifest` 与 `gates`；任一硬门槛失败时 UI 显示“不通过”。
 6. 不删除失败实验，不用新参数覆盖旧模型版本。
 
+研究服务对最终测试隔离采取失败关闭：参数敏感性和因子消融只能接收截止验证期末的受限快照；该快照不转发原快照 `metadata`，防止其中的最终测试基线或全期市场输入泄漏。研究报告的 `parameter_experiment_scope` 必须满足 `end < final_test.start` 且 `overlaps_final_test=false`，然后才可在冻结参数后执行最终测试。
+
+三条基线不得由股票池横截面收益缩放或复制生成。真实研究快照必须显式提供以下契约；每条序列须覆盖最终测试收益的全部日期。缺少序列、来源或日期时，研究仍生成不可变证据包，但 `BT-006-BASELINES` 与 `BT-008-EXCESS` 门禁必须为 `FAIL`，超额收益记为不可计算，而不是填入代理值。
+
+```json
+{
+  "research_baselines": {
+    "schema_version": "research-baselines/v1",
+    "series": {
+      "沪深300": {
+        "returns_by_date": {"2025-01-02": 0.001},
+        "source": "数据集与版本标识",
+        "is_official_point_in_time": true
+      },
+      "中证全指": {"returns_by_date": {"2025-01-02": 0.0012}, "source": "数据集与版本标识"},
+      "简单动量": {"returns_by_date": {"2025-01-02": -0.0004}, "source": "研究实现与版本标识"}
+    }
+  }
+}
+```
+
 长任务失败可从已验证 checkpoint 重启，但 checkpoint 必须绑定 snapshot/config hash。不得把不同数据或配置的片段拼成一个报告。
 
 ## 7. 模拟盘运行

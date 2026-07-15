@@ -188,3 +188,135 @@ def test_akshare_factory_interval_validation_is_fail_closed(monkeypatch):
                                   "QUANT_AKSHARE_MIN_REQUEST_INTERVAL_SECONDS": "0.75"})
     assert isinstance(provider, AkshareProvider)
     assert provider.min_request_interval_seconds == 0.75
+
+
+def test_dynamic_snapshot_screen_is_bounded_deterministic_and_excludes_unsupported_names():
+    records = [
+        {"代码": "600000", "名称": "浦发银行", "最新价": 12, "成交额": 500_000_000, "60日涨跌幅": -10},
+        {"代码": "688001", "名称": "华兴源创", "最新价": 30, "成交额": 300_000_000, "60日涨跌幅": 20},
+        {"代码": "000001", "名称": "平安银行", "最新价": 10, "成交额": 200_000_000, "60日涨跌幅": 10},
+        {"代码": "300001", "名称": "特锐德", "最新价": 20, "成交额": 150_000_000, "60日涨跌幅": 100},
+        {"代码": "830001", "名称": "北交样本", "最新价": 8, "成交额": 900_000_000, "60日涨跌幅": 90},
+        {"代码": "200001", "名称": "深B样本", "最新价": 5, "成交额": 900_000_000, "60日涨跌幅": 90},
+        {"代码": "000002", "名称": "ST样本", "最新价": 5, "成交额": 900_000_000, "60日涨跌幅": 90},
+        {"代码": "000003", "名称": "低成交", "最新价": 5, "成交额": 99_999_999, "60日涨跌幅": 90},
+        {"代码": "000004", "名称": "停牌价", "最新价": None, "成交额": 900_000_000, "60日涨跌幅": 90},
+    ]
+    api = SimpleNamespace(stock_zh_a_spot_em=lambda: Frame(records))
+    provider = AkshareProvider(("000001.SZ",), dynamic_universe_limit=3)
+
+    symbols, audit = provider._select_observation_universe(api, date.today(), allow_current_snapshot=True)
+
+    assert symbols == ("600000.SH", "688001.SH", "000001.SZ")
+    assert audit["mode"] == "dynamic_current_snapshot"
+    assert audit["selected_count"] == 3
+    assert audit["rejected"] == {
+        "invalid_or_unsupported_code": 2,
+        "duplicate_symbol": 0,
+        "st_or_delisting_name": 1,
+        "invalid_price": 1,
+        "below_min_turnover": 1,
+    }
+    assert audit["selection_snapshot_is_pit"] is False
+    assert audit["simulation_matching_ready"] is False
+
+
+def test_dynamic_industry_failure_falls_back_to_complete_configured_pool_before_history(monkeypatch, tmp_path):
+    end = date.today()
+    fake = FakeAkshare(end, metadata_failure=True)
+    module = SimpleNamespace(
+        stock_zh_a_spot_em=lambda: Frame([
+            {"代码": "600000", "名称": "浦发银行", "最新价": 12,
+             "成交额": 500_000_000, "60日涨跌幅": 15},
+        ]),
+        stock_individual_info_em=fake.stock_individual_info_em,
+        stock_zh_a_hist=fake.stock_zh_a_hist,
+        stock_zh_a_daily=fake.stock_zh_a_daily,
+    )
+    monkeypatch.setitem(sys.modules, "akshare", module)
+    metadata = tmp_path / "universe.csv"
+    metadata.write_text(
+        "symbol,name,industry,list_date\n000001.SZ,平安银行,银行,1991-04-03\n",
+        encoding="utf-8",
+    )
+
+    snapshot = AkshareProvider(("000001.SZ",), metadata_path=metadata).load(end)
+
+    assert {bar.symbol for bar in snapshot.bars} == {"000001.SZ"}
+    assert fake.history_calls[0]["symbol"] == "000001"
+    audit = snapshot.metadata["universe_selection"]
+    assert audit["mode"] == "configured_fallback"
+    assert audit["fallback_reason"] == "dynamic_industry_metadata_unavailable"
+    assert audit["dynamic_attempt"]["selected_symbols"] == ["600000.SH"]
+    assert snapshot.metadata["security_metadata"]["sources"] == {
+        "000001.SZ": "configured_static_fallback"
+    }
+
+
+def test_dynamic_listing_age_filter_runs_before_history_requests(monkeypatch):
+    end = date.today()
+    history_symbols: list[str] = []
+
+    def info(symbol: str):
+        listed = end - timedelta(days=30 if symbol == "000001" else 1_000)
+        return Frame([
+            {"item": "股票简称", "value": symbol},
+            {"item": "行业", "value": "测试行业"},
+            {"item": "上市时间", "value": listed.strftime("%Y%m%d")},
+        ])
+
+    def history(**kwargs):
+        history_symbols.append(kwargs["symbol"])
+        records = []
+        for offset in range(65):
+            day = end - timedelta(days=64 - offset)
+            records.append({"日期": day.isoformat(), "开盘": 10, "收盘": 10.2,
+                            "最高": 10.5, "最低": 9.8, "成交量": 1_000_000,
+                            "成交额": 10_200_000})
+        return Frame(records)
+
+    module = SimpleNamespace(
+        stock_zh_a_spot_em=lambda: Frame([
+            {"代码": "000001", "名称": "新股样本", "最新价": 10,
+             "成交额": 500_000_000, "60日涨跌幅": 20},
+            {"代码": "600000", "名称": "成熟样本", "最新价": 12,
+             "成交额": 400_000_000, "60日涨跌幅": 10},
+        ]),
+        stock_individual_info_em=info,
+        stock_zh_a_hist=history,
+    )
+    monkeypatch.setitem(sys.modules, "akshare", module)
+
+    snapshot = AkshareProvider(("600000.SH",), dynamic_universe_limit=2).load(end)
+
+    assert history_symbols == ["600000"]
+    assert snapshot.expected_symbols == 1
+    listing_filter = snapshot.metadata["universe_selection"]["listing_age_filter"]
+    assert listing_filter["excluded_symbols"] == ["000001.SZ"]
+    assert listing_filter["minimum_calendar_days"] == 120
+
+
+def test_historical_as_of_never_uses_current_all_a_snapshot(monkeypatch):
+    end = date.today() - timedelta(days=1)
+    fake = FakeAkshare(end)
+    spot_calls = 0
+
+    def spot():
+        nonlocal spot_calls
+        spot_calls += 1
+        return Frame([])
+
+    module = SimpleNamespace(
+        stock_zh_a_spot_em=spot,
+        stock_individual_info_em=fake.stock_individual_info_em,
+        stock_zh_a_hist=fake.stock_zh_a_hist,
+        stock_zh_a_daily=fake.stock_zh_a_daily,
+    )
+    monkeypatch.setitem(sys.modules, "akshare", module)
+
+    snapshot = AkshareProvider(("000001.SZ",)).load(end)
+
+    assert spot_calls == 0
+    assert snapshot.metadata["universe_selection"]["fallback_reason"] == (
+        "current_snapshot_not_valid_for_historical_as_of"
+    )

@@ -3,6 +3,7 @@ import http from 'node:http';
 import path from 'node:path';
 
 const port=Number(process.env.PORT||8080);
+const publicAdminEnabled=String(process.env.QUANT_PUBLIC_ADMIN_ENABLED||'false').toLowerCase()==='true';
 const publicDir='/app/dist';
 const mime={'.css':'text/css; charset=utf-8','.html':'text/html; charset=utf-8','.ico':'image/x-icon',
   '.js':'text/javascript; charset=utf-8','.json':'application/json; charset=utf-8','.png':'image/png',
@@ -40,6 +41,14 @@ async function staticFile(req,res){
 }
 
 http.createServer((req,res)=>{
+  const mutating=new Set(['POST','PUT','PATCH','DELETE']).has(req.method||'GET');
+  const address=req.socket.remoteAddress||'';
+  const loopback=address==='127.0.0.1'||address==='::1'||address==='::ffff:127.0.0.1';
+  const privateBridge=/^(::ffff:)?(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(address);
+  if((req.url||'').startsWith('/api/')&&mutating&&!publicAdminEnabled&&!loopback&&!privateBridge){
+    headers(res);res.writeHead(403,{'Content-Type':'application/json; charset=utf-8'});
+    res.end(JSON.stringify({error:{code:'PUBLIC_ADMIN_DISABLED',message:'公网HTTP仅开放只读查询；请通过服务器本机/SSH隧道管理，或配置HTTPS后显式启用。'}}));return;
+  }
   if((req.url||'').startsWith('/api/')||(req.url||'')==='/health')proxy(req,res);
   else if(req.method==='GET'||req.method==='HEAD')void staticFile(req,res);
   else{headers(res);res.writeHead(405,{'Allow':'GET, HEAD'});res.end();}

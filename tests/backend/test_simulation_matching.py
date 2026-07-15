@@ -39,7 +39,8 @@ def test_partial_and_rejected_constraints_are_persisted(tmp_path):
     assert partial["status"]=="partial" and partial["filled_quantity"]==100
     repo.append_simulation_intents("rejected","2026-07-07T18:00:00+08:00","2026-07-08T09:30:00+08:00",
                                    [{"symbol":"HALT","side":"buy","amount":20_000}])
-    rejected=repo.match_pending("2026-07-08T18:00:00+08:00",{"HALT":bar("HALT",suspended=True)})[0]
+    outcomes=repo.match_pending("2026-07-08T18:00:00+08:00",{"HALT":bar("HALT",suspended=True)})
+    rejected=next(item for item in outcomes if item["symbol"]=="HALT")
     assert rejected["status"]=="rejected" and rejected["reason"]=="suspended_or_price_limit"
     records={x["run_key"]:x for x in repo.simulation()["ledger"]}
     assert records["partial"]["status"]=="partial" and records["rejected"]["status"]=="rejected"

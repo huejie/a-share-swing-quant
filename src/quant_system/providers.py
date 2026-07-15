@@ -8,7 +8,7 @@ import time as clock_time
 from abc import ABC, abstractmethod
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from statistics import median
+from statistics import mean, median
 from zoneinfo import ZoneInfo
 
 from .models import Bar, DataSnapshot
@@ -713,12 +713,25 @@ class AkshareProvider(MarketDataProvider):
 
     def __init__(self, symbols: tuple[str, ...] = (), *, metadata_path: str | Path | None = None,
                  min_request_interval_seconds: float = 0.0,
+                 dynamic_universe: bool = True, dynamic_universe_limit: int = 60,
+                 min_snapshot_turnover: float = 100_000_000.0,
+                 min_listed_days: int = 120,
                  sleeper=clock_time.sleep, clock=clock_time.monotonic):
         if min_request_interval_seconds < 0:
             raise ValueError("AKShare minimum request interval cannot be negative")
+        if not 1 <= dynamic_universe_limit <= 60:
+            raise ValueError("AKShare dynamic universe limit must be between 1 and 60")
+        if not math.isfinite(min_snapshot_turnover) or min_snapshot_turnover < 0:
+            raise ValueError("AKShare minimum snapshot turnover must be a non-negative finite number")
+        if min_listed_days < 0:
+            raise ValueError("AKShare minimum listed days cannot be negative")
         self.symbols = symbols
         self.metadata_path = Path(metadata_path) if metadata_path else None
         self.min_request_interval_seconds = min_request_interval_seconds
+        self.dynamic_universe = dynamic_universe
+        self.dynamic_universe_limit = dynamic_universe_limit
+        self.min_snapshot_turnover = min_snapshot_turnover
+        self.min_listed_days = min_listed_days
         self._sleeper = sleeper
         self._clock = clock
         self._last_request_started_at: float | None = None
@@ -777,6 +790,185 @@ class AkshareProvider(MarketDataProvider):
         except Exception:
             raise RuntimeError(f"AKShare {method} request failed") from None
 
+    @staticmethod
+    def _score(value: float) -> float:
+        return round(max(0.0, min(100.0, value)), 1)
+
+    @classmethod
+    def _series_signal(
+        cls,
+        records: list[dict[str, object]],
+        end: date,
+        *,
+        dataset: str,
+        date_fields: tuple[str, ...] = ("日期", "date"),
+        value_fields: tuple[str, ...] = ("最新价", "收盘", "close"),
+        direction: float = 1.0,
+        use_difference: bool = False,
+    ) -> dict[str, object]:
+        """Turn a public macro/market series into an auditable bounded risk score.
+
+        ``direction`` is positive for risk-on series (equities/copper) and
+        negative for risk-off series (USD/CNH, yields, volatility/gold).  The
+        helper deliberately exposes its inputs and transformation; it never
+        labels a public price proxy as a directly observed investor flow.
+        """
+        values: list[tuple[date, float]] = []
+        for row in records:
+            try:
+                day = cls._day(cls._value(row, date_fields, dataset=dataset), dataset=dataset)
+                value = float(cls._value(row, value_fields, dataset=dataset))
+            except (RuntimeError, TypeError, ValueError, OverflowError):
+                continue
+            if day <= end and math.isfinite(value) and value > 0:
+                values.append((day, value))
+        values = sorted(dict(values).items())
+        if len(values) < 21:
+            raise RuntimeError(f"AKShare {dataset} has fewer than 21 usable observations")
+        latest_day, latest = values[-1]
+        prior20 = values[-21][1]
+        prior60 = values[-61][1] if len(values) >= 61 else values[0][1]
+        if use_difference:
+            signal20 = latest - prior20
+            signal60 = latest - prior60
+            raw_score = 50 + direction * (signal20 * 4 + signal60 * 1.5)
+        else:
+            signal20 = latest / prior20 - 1
+            signal60 = latest / prior60 - 1
+            raw_score = 50 + direction * (signal20 * 180 + signal60 * 80)
+        return {
+            "status": "available",
+            "as_of": latest_day.isoformat(),
+            "observations": len(values),
+            "latest": round(latest, 6),
+            "change_20d": round(signal20, 6),
+            "change_60d": round(signal60, 6),
+            "score": cls._score(raw_score),
+            "transformation": "50 + signed(20d×180 + 60d×80)" if not use_difference else
+                              "50 + signed(20d差×4 + 60d差×1.5)",
+        }
+
+    def _optional_series(
+        self,
+        api: object,
+        end: date,
+        *,
+        method: str,
+        kwargs: dict[str, object] | None = None,
+        date_fields: tuple[str, ...] = ("日期", "date"),
+        value_fields: tuple[str, ...] = ("最新价", "收盘", "close"),
+        direction: float = 1.0,
+        use_difference: bool = False,
+        label: str,
+    ) -> dict[str, object]:
+        try:
+            records = self._request(api, method, **(kwargs or {}))
+            return {
+                "label": label,
+                "source": f"AKShare.{method}",
+                **self._series_signal(
+                    records, end, dataset=method, date_fields=date_fields,
+                    value_fields=value_fields, direction=direction,
+                    use_difference=use_difference,
+                ),
+            }
+        except RuntimeError as exc:
+            return {
+                "label": label,
+                "source": f"AKShare.{method}",
+                "status": "unavailable",
+                "score": 50.0,
+                "error": str(exc),
+                "warning": "公开增强接口不可用，本分项显式中性，不用旧值冒充当期数据",
+            }
+
+    def _public_market_enrichment(self, api: object, end: date, bars: list[Bar]) -> tuple[dict, dict]:
+        global_components = {
+            "sp500": self._optional_series(api, end, method="index_global_hist_em",
+                kwargs={"symbol": "标普500"}, direction=1, label="标普500"),
+            "nasdaq": self._optional_series(api, end, method="index_global_hist_em",
+                kwargs={"symbol": "纳斯达克"}, direction=1, label="纳斯达克"),
+            "nikkei225": self._optional_series(api, end, method="index_global_hist_em",
+                kwargs={"symbol": "日经225"}, direction=1, label="日经225"),
+            "hang_seng": self._optional_series(api, end, method="index_global_hist_em",
+                kwargs={"symbol": "恒生指数"}, direction=1, label="恒生指数"),
+            "usd_cnh": self._optional_series(api, end, method="forex_hist_em",
+                kwargs={"symbol": "USDCNH"}, direction=-1, label="美元兑离岸人民币"),
+            "us_10y_yield": self._optional_series(api, end, method="bond_zh_us_rate",
+                kwargs={"start_date": (end - timedelta(days=400)).strftime("%Y%m%d")},
+                value_fields=("美国国债收益率10年",), direction=-1, use_difference=True,
+                label="美国10年国债收益率"),
+            "china_volatility": self._optional_series(api, end, method="index_option_300etf_qvix",
+                value_fields=("close", "收盘价", "收盘"), direction=-1, label="沪深300ETF期权波动率"),
+            "gold": self._optional_series(api, end, method="index_global_hist_em",
+                kwargs={"symbol": "COMEX黄金"}, direction=-1, label="COMEX黄金"),
+        }
+        available_global = [float(item["score"]) for item in global_components.values()
+                            if item["status"] == "available"]
+        global_quality = ("multi_asset_public_proxy" if len(available_global) == len(global_components)
+                          else "partial_multi_asset_public_proxy" if available_global else "neutral_missing")
+        global_score = self._score(mean(available_global)) if available_global else 50.0
+
+        # A verifiable transaction-structure proxy derived from the configured
+        # observation pool.  This is intentionally *not* called 主力资金流入.
+        histories: dict[str, list[Bar]] = {}
+        for bar in bars:
+            histories.setdefault(bar.symbol, []).append(bar)
+        for values in histories.values():
+            values.sort(key=lambda item: item.day)
+        eligible = [values for values in histories.values() if len(values) >= 21]
+        if eligible:
+            latest_amount = sum(values[-1].amount for values in eligible)
+            amount20 = mean(sum(values[-offset].amount for values in eligible) for offset in range(1, 21))
+            advancing_amount = sum(values[-1].amount for values in eligible
+                                   if values[-1].close > values[-2].close)
+            advance_share = advancing_amount / latest_amount if latest_amount else .5
+            positive20 = mean(1.0 if values[-1].close > values[-21].close else 0.0 for values in eligible)
+            amount_ratio = latest_amount / amount20 if amount20 else 1.0
+            fund_score = self._score(50 + (amount_ratio - 1) * 25 + (advance_share - .5) * 30 +
+                                     (positive20 - .5) * 20)
+            fund_flow = {
+                "status": "available", "score": fund_score,
+                "quality": "watchlist_turnover_breadth_proxy",
+                "as_of": max(values[-1].day for values in eligible).isoformat(),
+                "amount_ratio_vs_20d": round(amount_ratio, 4),
+                "advancing_amount_share": round(advance_share, 4),
+                "positive_20d_breadth": round(positive20, 4),
+                "universe_symbols": len(eligible),
+                "source": "本次有界观察池成交额结构、上涨成交额占比与20日广度",
+                "warning": "这是可复算的资金活跃度代理，不是券商账户流向或所谓主力净流入",
+            }
+        else:
+            fund_flow = {"status": "unavailable", "score": 50.0, "quality": "neutral_missing",
+                         "warning": "观察池历史不足，资金代理显式中性"}
+
+        valuation = self._optional_series(api, end, method="stock_a_ttm_lyr",
+            value_fields=("middlePETTM", "中位数市盈率TTM", "市盈率TTM中位数", "middlePELYR"),
+            direction=-1, label="全A估值中位数")
+        # Valuation levels are not return series, so keep the optional series'
+        # transparent trend score and label the limitation explicitly.
+        valuation["warning"] = (valuation.get("warning", "") +
+            "；估值分仅反映公开全A中位数估值的20/60日变化，不代表绝对便宜或昂贵").strip("；")
+
+        market_inputs = {
+            "global_risk_score": global_score,
+            "global_risk_quality": global_quality,
+            "global_risk_proxy": "全球股指、美元兑人民币、利率、波动率和商品的可用分项等权风险代理",
+            "global_components_available": len(available_global),
+            "global_components_total": len(global_components),
+            "fund_flow_score": float(fund_flow["score"]),
+            "fund_flow_quality": fund_flow["quality"],
+            "fund_flow_proxy": fund_flow.get("source", fund_flow.get("warning")),
+            "valuation_score": float(valuation["score"]),
+            "valuation_quality": "public_trend_proxy" if valuation["status"] == "available" else "neutral_missing",
+            "source": "AKShare公开多资产增强；各分项失败时独立中性降级，分数和原始代理均留审计",
+        }
+        audit = {"global_risk": {"status": "available" if available_global else "unavailable",
+                                  "quality": global_quality, "score": global_score,
+                                  "components": global_components},
+                 "fund_flow": fund_flow, "valuation": valuation}
+        return market_inputs, audit
+
     def _security_info(self, api: object, symbol: str) -> tuple[str, str, date]:
         records = self._request(api, "stock_individual_info_em", symbol=symbol.split(".", 1)[0])
         values: dict[str, object] = {}
@@ -825,17 +1017,195 @@ class AkshareProvider(MarketDataProvider):
             return f"sz{code}"
         raise RuntimeError(f"AKShare Sina fallback does not support board for {symbol}; observation is blocked")
 
+    @staticmethod
+    def _canonical_mainland_a_symbol(value: object) -> str | None:
+        """Return a canonical SSE/SZSE A-share symbol, excluding BSE/B shares.
+
+        ``stock_zh_a_spot_em`` currently combines Shanghai, Shenzhen and
+        Beijing A shares.  The provider intentionally accepts only the known
+        SSE ``6xxxxx`` and SZSE ``0xxxxx/3xxxxx`` namespaces.  Beijing
+        ``4/8/92`` codes and Shenzhen/Shanghai B-share ``200/900`` codes are
+        therefore rejected before any per-symbol request is made.
+        """
+        code = str(value or "").strip()
+        if len(code) != 6 or not code.isdigit():
+            return None
+        if code.startswith("6"):
+            return f"{code}.SH"
+        if code.startswith(("000", "001", "002", "003", "300", "301")):
+            return f"{code}.SZ"
+        return None
+
+    @staticmethod
+    def _optional_number(row: dict[str, object], aliases: tuple[str, ...]) -> float | None:
+        for field in aliases:
+            value = row.get(field)
+            if value is None or str(value).strip().lower() in {"", "nan", "none", "-", "--", "—"}:
+                continue
+            try:
+                number = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(number):
+                return number
+        return None
+
+    def _configured_universe_audit(self, end: date, reason: str, error: str | None = None) -> dict:
+        return {
+            "mode": "configured_fallback",
+            "source": "QUANT_AKSHARE_SYMBOLS",
+            "requested_as_of": end.isoformat(),
+            "selection_snapshot_kind": "configured_current_watchlist",
+            "selection_snapshot_is_pit": False,
+            "production_ready": False,
+            "simulation_matching_ready": False,
+            "fallback_used": True,
+            "fallback_reason": reason,
+            "fallback_error": error,
+            "configured_fallback_count": len(self.symbols),
+            "selected_count": len(self.symbols),
+            "selected_symbols": list(self.symbols),
+            "warning": "配置池是运行期观察范围，不是历史时点成分；不得用于PIT回测或模拟撮合",
+        }
+
+    def _select_observation_universe(self, api: object, end: date, *, allow_current_snapshot: bool) -> tuple[tuple[str, ...], dict]:
+        """Stage one: reduce the current all-A snapshot to at most 60 names.
+
+        This is deliberately a *current-snapshot* screen.  A caller asking for
+        a historical ``as_of`` date is routed to the configured watchlist so a
+        present-day ranking can never masquerade as a point-in-time universe.
+        """
+        if not self.dynamic_universe:
+            return self.symbols, self._configured_universe_audit(end, "dynamic_selection_disabled")
+        if not allow_current_snapshot:
+            return self.symbols, self._configured_universe_audit(
+                end, "current_snapshot_not_valid_for_historical_as_of"
+            )
+        try:
+            records = self._request(api, "stock_zh_a_spot_em")
+        except RuntimeError as exc:
+            return self.symbols, self._configured_universe_audit(
+                end, "all_a_snapshot_unavailable", str(exc)
+            )
+
+        rejected = {
+            "invalid_or_unsupported_code": 0,
+            "duplicate_symbol": 0,
+            "st_or_delisting_name": 0,
+            "invalid_price": 0,
+            "below_min_turnover": 0,
+        }
+        candidates: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for row in records:
+            symbol = self._canonical_mainland_a_symbol(row.get("代码") or row.get("code"))
+            if symbol is None:
+                rejected["invalid_or_unsupported_code"] += 1
+                continue
+            if symbol in seen:
+                rejected["duplicate_symbol"] += 1
+                continue
+            seen.add(symbol)
+            name = str(row.get("名称") or row.get("name") or symbol).strip()
+            upper_name = name.upper()
+            if "ST" in upper_name or "退" in name:
+                rejected["st_or_delisting_name"] += 1
+                continue
+            price = self._optional_number(row, ("最新价", "close", "price"))
+            if price is None or price <= 0:
+                rejected["invalid_price"] += 1
+                continue
+            turnover = self._optional_number(row, ("成交额", "amount", "turnover"))
+            if turnover is None or turnover < self.min_snapshot_turnover:
+                rejected["below_min_turnover"] += 1
+                continue
+            trend_field = "60日涨跌幅"
+            trend = self._optional_number(row, (trend_field,))
+            if trend is None:
+                trend_field = "年初至今涨跌幅"
+                trend = self._optional_number(row, (trend_field,))
+            if trend is None:
+                trend_field = "涨跌幅"
+                trend = self._optional_number(row, (trend_field,))
+            if trend is None:
+                trend_field = "neutral_missing"
+                trend = 0.0
+            candidates.append({"symbol": symbol, "name": name, "turnover": turnover,
+                               "trend": trend, "trend_field": trend_field})
+
+        if not candidates:
+            return self.symbols, self._configured_universe_audit(
+                end, "all_a_snapshot_has_no_eligible_candidates"
+            )
+
+        # Cross-sectional liquidity ranks avoid hard-coding a market-size
+        # scale; the bounded 60-day trend proxy prevents a one-day spike from
+        # dominating.  Symbol is the final tie-breaker for reproducible tests.
+        liquidity_order = sorted(candidates, key=lambda item: (float(item["turnover"]), str(item["symbol"])))
+        denominator = max(1, len(liquidity_order) - 1)
+        liquidity_rank = {
+            str(item["symbol"]): index / denominator for index, item in enumerate(liquidity_order)
+        }
+        for item in candidates:
+            trend = max(-50.0, min(100.0, float(item["trend"])))
+            trend_score = (trend + 50.0) / 150.0
+            item["selection_score"] = round(
+                liquidity_rank[str(item["symbol"])] * 0.7 + trend_score * 0.3, 6
+            )
+        ranked = sorted(
+            candidates,
+            key=lambda item: (-float(item["selection_score"]), -float(item["turnover"]), str(item["symbol"])),
+        )
+        selected = ranked[: self.dynamic_universe_limit]
+        symbols = tuple(str(item["symbol"]) for item in selected)
+        audit = {
+            "mode": "dynamic_current_snapshot",
+            "source": "AKShare.stock_zh_a_spot_em",
+            "requested_as_of": end.isoformat(),
+            "selection_snapshot_kind": "runtime_realtime_or_latest_close_snapshot",
+            "selection_snapshot_is_pit": False,
+            "production_ready": False,
+            "simulation_matching_ready": False,
+            "fallback_used": False,
+            "fallback_reason": None,
+            "configured_fallback_count": len(self.symbols),
+            "raw_rows": len(records),
+            "eligible_rows": len(candidates),
+            "rejected": rejected,
+            "minimum_turnover_cny": self.min_snapshot_turnover,
+            "maximum_candidates": self.dynamic_universe_limit,
+            "score_formula": "0.70×成交额横截面分位 + 0.30×[-50%,100%]截断趋势归一分",
+            "trend_fallback_order": ["60日涨跌幅", "年初至今涨跌幅", "涨跌幅", "neutral_missing"],
+            "selected_count": len(symbols),
+            "selected_symbols": list(symbols),
+            "selected": [
+                {"symbol": item["symbol"], "name": item["name"],
+                 "turnover_cny": round(float(item["turnover"]), 2),
+                 "trend_percent": round(float(item["trend"]), 4),
+                 "trend_field": item["trend_field"], "score": item["selection_score"]}
+                for item in selected
+            ],
+            "warning": "该排名只反映请求时的当前快照，不是历史PIT股票池，不能用于历史成分重建或模拟撮合",
+        }
+        return symbols, audit
+
     def status(self) -> dict:
         try: import akshare  # noqa
         except ImportError: return {"provider": self.name, "available": False, "reason": "optional package not installed"}
         return {"provider": self.name, "available": True, "observation_only": True,
                 "production_ready": False, "pit_verified": False,
                 "metadata_fallback_configured": self.metadata_path is not None,
+                "dynamic_universe": self.dynamic_universe,
+                "dynamic_universe_limit": self.dynamic_universe_limit,
+                "min_snapshot_turnover": self.min_snapshot_turnover,
+                "min_listed_days": self.min_listed_days,
                 "min_request_interval_seconds": self.min_request_interval_seconds,
                 "warning": "前复权行情仅供前瞻观察；网页接口未证明PIT、历史成分或商业授权"}
 
     def load(self, as_of: date | None = None) -> DataSnapshot:
-        if not self.status()["available"]: raise RuntimeError(self.status()["reason"])
+        status = self.status()
+        if not status["available"]:
+            raise RuntimeError(status["reason"])
         if not self.symbols: raise RuntimeError("configure prototype symbols explicitly")
         import akshare as ak
         end = as_of or date.today()
@@ -845,29 +1215,95 @@ class AkshareProvider(MarketDataProvider):
         bars: list[Bar] = []
         history_counts: dict[str, int] = {}
         configured_metadata = self._configured_security_metadata()
+        selected_symbols, universe_selection = self._select_observation_universe(
+            ak, end, allow_current_snapshot=as_of is None or as_of == date.today()
+        )
         metadata_sources: dict[str, str] = {}
+        security_metadata: dict[str, tuple[str, str, date]] = {}
         live_metadata_available = True
         live_metadata_error: str | None = None
         history_sources: dict[str, str] = {}
         eastmoney_history_available = True
         eastmoney_history_error: str | None = None
-        for symbol in self.symbols:
-            if live_metadata_available:
+
+        if universe_selection["mode"] == "dynamic_current_snapshot":
+            dynamic_metadata: dict[str, tuple[str, str, date]] = {}
+            for symbol in selected_symbols:
                 try:
-                    name, industry, listed_at = self._security_info(ak, symbol)
+                    dynamic_metadata[symbol] = self._security_info(ak, symbol)
                     metadata_sources[symbol] = "stock_individual_info_em"
                 except RuntimeError as exc:
                     live_metadata_available = False
                     live_metadata_error = str(exc)
+                    break
             if not live_metadata_available:
-                fallback = configured_metadata.get(symbol)
-                if fallback is None:
+                missing = [symbol for symbol in self.symbols if symbol not in configured_metadata]
+                if missing:
                     raise RuntimeError(
-                        f"AKShare live metadata is unavailable for {symbol}: {live_metadata_error}; "
-                        "configured metadata is missing; observation is blocked"
+                        f"AKShare dynamic industry metadata is unavailable: {live_metadata_error}; "
+                        f"configured metadata is missing {missing[0]}; observation is blocked"
                     ) from None
-                name, industry, listed_at = fallback
-                metadata_sources[symbol] = "configured_static_fallback"
+                dynamic_attempt = universe_selection
+                universe_selection = self._configured_universe_audit(
+                    end, "dynamic_industry_metadata_unavailable", live_metadata_error
+                )
+                universe_selection["dynamic_attempt"] = dynamic_attempt
+                selected_symbols = self.symbols
+                security_metadata = {symbol: configured_metadata[symbol] for symbol in selected_symbols}
+                metadata_sources = {symbol: "configured_static_fallback" for symbol in selected_symbols}
+            else:
+                excluded_recent = [
+                    symbol for symbol, (_, _, listed_at) in dynamic_metadata.items()
+                    if (end - listed_at).days < self.min_listed_days
+                ]
+                selected_symbols = tuple(symbol for symbol in selected_symbols if symbol not in excluded_recent)
+                universe_selection["listing_age_filter"] = {
+                    "status": "available_from_stock_individual_info_em",
+                    "minimum_calendar_days": self.min_listed_days,
+                    "excluded_count": len(excluded_recent),
+                    "excluded_symbols": excluded_recent,
+                }
+                universe_selection["selected_count"] = len(selected_symbols)
+                universe_selection["selected_symbols"] = list(selected_symbols)
+                if not selected_symbols:
+                    missing = [symbol for symbol in self.symbols if symbol not in configured_metadata]
+                    if missing:
+                        raise RuntimeError(
+                            "AKShare dynamic universe has no candidates after listing-age filtering and "
+                            f"configured metadata is missing {missing[0]}; observation is blocked"
+                        )
+                    dynamic_attempt = universe_selection
+                    universe_selection = self._configured_universe_audit(
+                        end, "no_dynamic_candidates_after_listing_age_filter"
+                    )
+                    universe_selection["dynamic_attempt"] = dynamic_attempt
+                    selected_symbols = self.symbols
+                    security_metadata = {symbol: configured_metadata[symbol] for symbol in selected_symbols}
+                    metadata_sources = {symbol: "configured_static_fallback" for symbol in selected_symbols}
+                else:
+                    security_metadata = {symbol: dynamic_metadata[symbol] for symbol in selected_symbols}
+                    metadata_sources = {symbol: "stock_individual_info_em" for symbol in selected_symbols}
+        else:
+            for symbol in selected_symbols:
+                if live_metadata_available:
+                    try:
+                        security_metadata[symbol] = self._security_info(ak, symbol)
+                        metadata_sources[symbol] = "stock_individual_info_em"
+                    except RuntimeError as exc:
+                        live_metadata_available = False
+                        live_metadata_error = str(exc)
+                if not live_metadata_available:
+                    fallback = configured_metadata.get(symbol)
+                    if fallback is None:
+                        raise RuntimeError(
+                            f"AKShare live metadata is unavailable for {symbol}: {live_metadata_error}; "
+                            "configured metadata is missing; observation is blocked"
+                        ) from None
+                    security_metadata[symbol] = fallback
+                    metadata_sources[symbol] = "configured_static_fallback"
+
+        for symbol in selected_symbols:
+            name, industry, listed_at = security_metadata[symbol]
             if not industry:
                 raise RuntimeError(f"AKShare industry is unavailable for {symbol}; observation is blocked")
             dataset = "stock_zh_a_hist"
@@ -927,10 +1363,12 @@ class AkshareProvider(MarketDataProvider):
         if not bars:
             raise RuntimeError("AKShare returned no qfq bars; observation is blocked")
         latest = max(x.day for x in bars)
+        market_inputs, market_enrichment = self._public_market_enrichment(ak, end, bars)
         metadata = {**self.status(), "prototype": True, "observation_only": True, "public_data": True,
                     "research_eligible": False, "production_ready": False,
                     "pit_verified": False, "pit_reconstruction": False, "authorization": False,
                     "simulation_matching_ready": False,
+                    "universe_selection": universe_selection,
                     "theme_mapping": {"status": "industry_fallback",
                                       "source": "stock_individual_info_em.行业 + 显式静态元数据回退" if not live_metadata_available else "stock_individual_info_em.行业",
                                       "missing_symbols": 0,
@@ -939,7 +1377,8 @@ class AkshareProvider(MarketDataProvider):
                                           "live_endpoint_available": live_metadata_available,
                                           "live_endpoint_error": live_metadata_error,
                                           "configured_file": self.metadata_path.name if self.metadata_path else None,
-                                          "warning": "静态元数据仅用于显式观察池身份/行业回退，不是PIT历史成分"},
+                                          "minimum_listed_days": self.min_listed_days,
+                                          "warning": "当前行业/上市日期只用于运行期预选；静态回退和实时端点均不是PIT历史成分"},
                     "price_history": {"sources": history_sources,
                                       "eastmoney_endpoint_available": eastmoney_history_available,
                                       "eastmoney_endpoint_error": eastmoney_history_error,
@@ -951,17 +1390,18 @@ class AkshareProvider(MarketDataProvider):
                                                     "warning": "接口直接返回前复权价格，不提供可审计的逐日原始复权因子"},
                                     "daily_basic": {"status": "unavailable", "reason": "not_collected",
                                                     "warning": "估值与流动性增强项按中性降级"},
-                                    "index_daily": {"status": "unavailable", "reason": "not_collected",
-                                                   "warning": "指数/全球风险增强项按中性降级"}},
-                    "market_inputs": {"global_risk_score": 50.0, "global_risk_quality": "neutral_missing",
-                                      "fund_flow_score": 50.0, "fund_flow_quality": "neutral_missing",
-                                      "valuation_score": 50.0, "valuation_quality": "neutral_missing",
-                                      "source": "AKShare前复权观察源；未采集增强项时显式中性"},
+                                    "index_daily": {"status": market_enrichment["global_risk"]["status"],
+                                                   "quality": market_enrichment["global_risk"]["quality"],
+                                                   "warning": "公开多资产代理只用于前瞻观察，不具备历史PIT保证"},
+                                    "global_risk": market_enrichment["global_risk"],
+                                    "fund_flow": market_enrichment["fund_flow"],
+                                    "valuation": market_enrichment["valuation"]},
+                    "market_inputs": market_inputs,
                     "data_quality": {"status": "observation_ready", "qfq_validated": True,
                                      "industry_complete": True, "history_counts": history_counts},
                     "neutral_stock_fields": {"quality": 50.0, "catalyst": 50.0,
                                              "reason": "公开接口未提供可验证的质量与催化评分"}}
-        return DataSnapshot(datetime.combine(latest, time(18), SHANGHAI), bars, self.name, len(self.symbols), metadata)
+        return DataSnapshot(datetime.combine(latest, time(18), SHANGHAI), bars, self.name, len(selected_symbols), metadata)
 
 
 def provider_from_env(environ: dict[str, str] | None = None) -> MarketDataProvider:
@@ -1010,9 +1450,35 @@ def provider_from_env(environ: dict[str, str] | None = None) -> MarketDataProvid
             raise RuntimeError("QUANT_AKSHARE_MIN_REQUEST_INTERVAL_SECONDS must be a non-negative number") from exc
         if interval < 0:
             raise RuntimeError("QUANT_AKSHARE_MIN_REQUEST_INTERVAL_SECONDS must be a non-negative number")
+        raw_dynamic = env.get("QUANT_AKSHARE_DYNAMIC_UNIVERSE", "true").strip().lower()
+        if raw_dynamic not in {"true", "false", "1", "0", "yes", "no"}:
+            raise RuntimeError("QUANT_AKSHARE_DYNAMIC_UNIVERSE must be true or false")
+        dynamic_universe = raw_dynamic in {"true", "1", "yes"}
+        try:
+            dynamic_limit = int(env.get("QUANT_AKSHARE_DYNAMIC_UNIVERSE_LIMIT", "60").strip())
+        except ValueError as exc:
+            raise RuntimeError("QUANT_AKSHARE_DYNAMIC_UNIVERSE_LIMIT must be an integer between 1 and 60") from exc
+        if not 1 <= dynamic_limit <= 60:
+            raise RuntimeError("QUANT_AKSHARE_DYNAMIC_UNIVERSE_LIMIT must be an integer between 1 and 60")
+        try:
+            min_turnover = float(env.get("QUANT_AKSHARE_MIN_SNAPSHOT_TURNOVER", "100000000").strip())
+        except ValueError as exc:
+            raise RuntimeError("QUANT_AKSHARE_MIN_SNAPSHOT_TURNOVER must be a non-negative finite number") from exc
+        if not math.isfinite(min_turnover) or min_turnover < 0:
+            raise RuntimeError("QUANT_AKSHARE_MIN_SNAPSHOT_TURNOVER must be a non-negative finite number")
+        try:
+            min_listed_days = int(env.get("QUANT_AKSHARE_MIN_LISTED_DAYS", "120").strip())
+        except ValueError as exc:
+            raise RuntimeError("QUANT_AKSHARE_MIN_LISTED_DAYS must be a non-negative integer") from exc
+        if min_listed_days < 0:
+            raise RuntimeError("QUANT_AKSHARE_MIN_LISTED_DAYS must be a non-negative integer")
         raw_metadata = env.get("QUANT_AKSHARE_METADATA_PATH", "").strip()
         metadata_path = Path(raw_metadata) if raw_metadata else None
         if metadata_path is not None and not metadata_path.is_file():
             raise RuntimeError(f"configured AKShare metadata does not exist: {metadata_path}")
-        return AkshareProvider(symbols, metadata_path=metadata_path, min_request_interval_seconds=interval)
+        return AkshareProvider(
+            symbols, metadata_path=metadata_path, min_request_interval_seconds=interval,
+            dynamic_universe=dynamic_universe, dynamic_universe_limit=dynamic_limit,
+            min_snapshot_turnover=min_turnover, min_listed_days=min_listed_days,
+        )
     raise RuntimeError(f"unsupported QUANT_DATA_PROVIDER={kind!r}; expected demo, csv, licensed-csv, tushare, or akshare")

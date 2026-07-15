@@ -18,6 +18,7 @@ class Lifecycle(StrEnum):
     DORMANT = "潜伏"
     STARTING = "启动"
     EXPANDING = "扩散"
+    HEALTHY = "健康趋势"
     ACCELERATING = "加速"
     CROWDED = "拥挤"
     FADING = "退潮"
@@ -84,6 +85,10 @@ class MarketAssessment:
     components: dict[str, float]
     style: str
     reasons: tuple[str, ...]
+    completeness: float = 1.0
+    confidence: float = 1.0
+    data_timestamp: datetime | None = None
+    component_quality: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -98,6 +103,8 @@ class ThemeAssessment:
     catalyst: float
     leadership: float
     crowding: float
+    lifecycle_reason: str = ""
+    fund_flow_label: str = "成交额占比变化代理"
 
 
 @dataclass(frozen=True)
@@ -115,6 +122,8 @@ class StockAssessment:
     reasons: tuple[str, ...]
     eligible: bool
     excluded_reason: str | None = None
+    theme_lifecycle: str = ""
+    gate_results: dict[str, dict[str, Any]] = field(default_factory=dict)
 
 
 @dataclass
@@ -140,6 +149,9 @@ class PositionAdvice:
     next_review_at: datetime
     model_version: str
     data_timestamp: datetime
+    entry_at: datetime | None = None
+    exit_priority: int | None = None
+    exit_reason: str | None = None
 
 
 @dataclass(frozen=True)

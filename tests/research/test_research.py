@@ -7,8 +7,9 @@ from quant_system.backtest import BacktestResult
 from quant_system.models import DataSnapshot
 from quant_system.research import (
     CAPITAL_TIERS, CORE_FACTORS, GateInput, canonical_json, content_hash,
-    evaluate_baselines, evaluate_capacity, evaluate_gates, factor_ablation,
-    make_manifest, make_time_series_split, parameter_sensitivity,
+    evaluate_baseline_contract, evaluate_baselines, evaluate_capacity,
+    evaluate_gates, factor_ablation, make_manifest,
+    make_parameter_selection_snapshot, make_time_series_split, parameter_sensitivity,
     stress_scenarios, write_evidence_package,
 )
 
@@ -44,6 +45,24 @@ def test_split_rejects_too_little_data_and_invalid_ratios():
         make_time_series_split([date(2020, 1, 1) + timedelta(days=i) for i in range(20)], .9, .2)
 
 
+def test_parameter_selection_snapshot_removes_final_dates_and_source_metadata():
+    from quant_system.models import Bar
+
+    days = [date(2020, 1, 1) + timedelta(days=i) for i in range(100)]
+    bars = [Bar("000001.SZ", "测试", day, 10, 10, 10, 10, 1000, 10_000, "主题", "行业") for day in days]
+    original = DataSnapshot(
+        datetime(2020, 4, 9, 18, tzinfo=timezone.utc), bars, "fixture", 1,
+        {"market_inputs": {"global_risk_score": 99}, "research_baselines": {"future": "secret"}},
+    )
+    split = make_time_series_split(days, embargo_observations=2)
+    restricted, scope = make_parameter_selection_snapshot(original, split)
+    assert max(bar.day.isoformat() for bar in restricted.bars) < split.windows[-1].start
+    assert restricted.as_of.date().isoformat() < split.windows[-1].start
+    assert scope.overlaps_final_test is False
+    assert scope.source_metadata_forwarded == ()
+    assert set(restricted.metadata) == {"research_scope"}
+
+
 def test_three_mandatory_baselines_have_metrics_and_provenance():
     returns = {
         "沪深300": [.01, -.02, .03], "中证全指": [.02, -.01, .01], "简单动量": [.03, -.03, .02],
@@ -54,6 +73,35 @@ def test_three_mandatory_baselines_have_metrics_and_provenance():
     assert all(x.observations == 3 and x.is_official_point_in_time for x in results)
     with pytest.raises(ValueError, match="missing required"):
         evaluate_baselines({"沪深300": [.01]})
+
+
+def test_baseline_contract_fails_closed_when_missing_and_evaluates_explicit_series():
+    days = ("2025-01-02", "2025-01-03")
+    missing = evaluate_baseline_contract({}, days)
+    assert missing.status == "missing" and not missing.results
+    assert missing.missing_series == ("沪深300", "中证全指", "简单动量")
+
+    contract = {
+        "research_baselines": {
+            "schema_version": "research-baselines/v1",
+            "series": {
+                name: {
+                    "returns_by_date": {days[0]: .01, days[1]: -.005},
+                    "source": f"licensed-fixture:{name}",
+                    "is_official_point_in_time": name != "简单动量",
+                }
+                for name in ("沪深300", "中证全指", "简单动量")
+            },
+        }
+    }
+    available = evaluate_baseline_contract(contract, days)
+    assert available.status == "available"
+    assert len(available.results) == 3
+    assert all(item.observations == 2 and "licensed-fixture" in item.source for item in available.results)
+
+    del contract["research_baselines"]["series"]["沪深300"]["returns_by_date"][days[1]]
+    incomplete = evaluate_baseline_contract(contract, days)
+    assert incomplete.status == "missing" and incomplete.missing_dates["沪深300"] == (days[1],)
 
 
 def test_four_exact_capital_tiers_and_capacity_constraints(snapshot):

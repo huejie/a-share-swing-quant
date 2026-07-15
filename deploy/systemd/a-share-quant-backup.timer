@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily A-share quant data backup
+
+[Timer]
+OnCalendar=*-*-* 02:30:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=300
+Unit=a-share-quant-backup.service
+
+[Install]
+WantedBy=timers.target

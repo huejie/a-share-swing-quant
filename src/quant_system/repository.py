@@ -62,6 +62,15 @@ class SQLiteRepository:
               PRIMARY KEY(account_id,symbol),
               FOREIGN KEY(account_id) REFERENCES simulation_accounts(id)
             );
+            CREATE TABLE IF NOT EXISTS settings_profiles(
+              id TEXT PRIMARY KEY, version INTEGER NOT NULL, updated_at TEXT NOT NULL,
+              payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS settings_audit(
+              id INTEGER PRIMARY KEY AUTOINCREMENT, profile_id TEXT NOT NULL,
+              version INTEGER NOT NULL, changed_at TEXT NOT NULL, actor TEXT NOT NULL,
+              previous_payload TEXT NOT NULL, payload TEXT NOT NULL
+            );
             """)
 
     def ping(self) -> bool:
@@ -91,6 +100,41 @@ class SQLiteRepository:
         with self.connect() as db: row=db.execute("SELECT payload FROM decisions WHERE id=?",(ident,)).fetchone()
         return json.loads(row[0]) if row else None
 
+    def load_settings(self, profile_id: str = "personal") -> dict | None:
+        with self.connect() as db:
+            row = db.execute("SELECT version,updated_at,payload FROM settings_profiles WHERE id=?",
+                             (profile_id,)).fetchone()
+        if row is None:
+            return None
+        return {**json.loads(row["payload"]), "settings_version": int(row["version"]),
+                "settings_updated_at": row["updated_at"]}
+
+    def save_settings(self, payload: dict, *, profile_id: str = "personal", actor: str = "product-api") -> dict:
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        now = datetime.now().astimezone().isoformat()
+        with self._lock, self.connect() as db:
+            row = db.execute("SELECT version,payload FROM settings_profiles WHERE id=?", (profile_id,)).fetchone()
+            previous = row["payload"] if row else "{}"
+            version = int(row["version"]) + 1 if row else 1
+            db.execute(
+                "INSERT INTO settings_profiles VALUES(?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET version=excluded.version,updated_at=excluded.updated_at,payload=excluded.payload",
+                (profile_id, version, now, encoded),
+            )
+            db.execute("INSERT INTO settings_audit(profile_id,version,changed_at,actor,previous_payload,payload) VALUES(?,?,?,?,?,?)",
+                       (profile_id, version, now, actor, previous, encoded))
+        return {**payload, "settings_version": version, "settings_updated_at": now}
+
+    def list_settings_audit(self, profile_id: str = "personal", limit: int = 50) -> list[dict]:
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT version,changed_at,actor,previous_payload,payload FROM settings_audit "
+                "WHERE profile_id=? ORDER BY id DESC LIMIT ?", (profile_id, limit),
+            ).fetchall()
+        return [{"version": int(row["version"]), "changed_at": row["changed_at"], "actor": row["actor"],
+                 "previous": json.loads(row["previous_payload"]), "settings": json.loads(row["payload"])}
+                for row in rows]
+
     def save_backtest(self, ident: str, result: dict):
         summary={k:v for k,v in result.items() if k not in ("fills","equity_curve")}
         now=datetime.now().astimezone().isoformat()
@@ -110,6 +154,32 @@ class SQLiteRepository:
         with self._lock,self.connect() as db:
             db.execute("INSERT OR IGNORE INTO simulation_accounts VALUES(?,?,?,?,?)",(account_id,capital,capital,capital,now))
             row=db.execute("SELECT * FROM simulation_accounts WHERE id=?",(account_id,)).fetchone()
+        return dict(row)
+
+    def reconfigure_simulation_account(self, capital: float, account_id: str = "model") -> dict:
+        """Start a clean capital lineage only while no virtual fill/position exists.
+
+        A capital edit must not silently rescale an already executed paper
+        portfolio.  Before the first fill we can safely cancel pending intents
+        and reset the empty account; afterwards the caller must create a new
+        simulation lineage instead.
+        """
+        now = datetime.now().astimezone().isoformat()
+        with self._lock, self.connect() as db:
+            positions = db.execute("SELECT COUNT(*) FROM simulation_positions WHERE account_id=?",
+                                   (account_id,)).fetchone()[0]
+            fills = db.execute("SELECT COUNT(*) FROM simulation_ledger WHERE status IN ('filled','partial')").fetchone()[0]
+            if positions or fills:
+                raise ValueError("模拟账户已有成交或持仓，不能原地修改本金；请保留历史并新建模拟账户")
+            db.execute("UPDATE simulation_ledger SET status='cancelled' WHERE status='pending'")
+            db.execute("DELETE FROM simulation_equity")
+            db.execute(
+                "INSERT INTO simulation_accounts VALUES(?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET initial_capital=excluded.initial_capital,cash=excluded.cash,"
+                "peak_equity=excluded.peak_equity,updated_at=excluded.updated_at",
+                (account_id, capital, capital, capital, now),
+            )
+            row = db.execute("SELECT * FROM simulation_accounts WHERE id=?", (account_id,)).fetchone()
         return dict(row)
 
     def simulation_positions(self, account_id: str="model") -> dict[str,dict]:
@@ -139,36 +209,51 @@ class SQLiteRepository:
             rows=db.execute("SELECT * FROM simulation_ledger WHERE status='pending' AND effective_at<=? ORDER BY id",(as_of,)).fetchall()
             for row in rows:
                 payload=json.loads(row["payload"]);side=payload.get("side","buy");symbol=row["symbol"];bar=bars.get(symbol)
+                # Absence from a supplied market slice is not proof that an
+                # order was rejected.  Keep the intent pending until a bar or
+                # an explicit suspension/limit state is observable.
+                if bar is None:
+                    continue
                 status="rejected";reason="missing_bar";requested=0;filled=0;price=None;fee=0.0;value=0.0
-                if bar is not None:
-                    blocked=bar.suspended or (side=="buy" and bar.limit_up) or (side=="sell" and bar.limit_down)
-                    if blocked:
-                        reason="suspended_or_price_limit"
+                blocked=bar.suspended or (side=="buy" and bar.limit_up) or (side=="sell" and bar.limit_down)
+                if blocked:
+                    reason="suspended_or_price_limit"
+                else:
+                    price=bar.open*(1+(slippage_bps/10000 if side=="buy" else -slippage_bps/10000))
+                    capacity=int((bar.volume*.01)//100)*100
+                    held=db.execute("SELECT shares,avg_cost FROM simulation_positions WHERE account_id=? AND symbol=?",(account_id,symbol)).fetchone()
+                    if side=="buy":
+                        requested=(int(row["quantity"] or 0) or
+                                   int(((row["amount"] or 0)/price)//100)*100)
+                        affordable=int((max(0,cash-5)/(price*1.0003))//100)*100
+                        filled=min(requested,capacity,affordable)
                     else:
-                        price=bar.open*(1+(slippage_bps/10000 if side=="buy" else -slippage_bps/10000))
-                        capacity=int((bar.volume*.01)//100)*100
-                        held=db.execute("SELECT shares,avg_cost FROM simulation_positions WHERE account_id=? AND symbol=?",(account_id,symbol)).fetchone()
+                        requested=int(row["quantity"] or (held["shares"] if held else 0))
+                        filled=min(requested,capacity,int(held["shares"] if held else 0))
+                    if requested<=0:reason="below_board_lot_or_no_position"
+                    elif filled<=0:reason="cash_or_capacity_unavailable"
+                    else:
+                        value=filled*price;fee=self._fee(value,side);status="filled" if filled==requested else "partial";reason="ok" if status=="filled" else "volume_or_cash_limited"
                         if side=="buy":
-                            requested=int(((row["amount"] or 0)/price)//100)*100
-                            affordable=int((max(0,cash-5)/(price*1.0003))//100)*100
-                            filled=min(requested,capacity,affordable)
+                            cash-=value+fee
+                            old_shares=int(held["shares"]) if held else 0;old_cost=float(held["avg_cost"]) if held else 0
+                            new_shares=old_shares+filled;avg=(old_shares*old_cost+value+fee)/new_shares
+                            db.execute("INSERT INTO simulation_positions VALUES(?,?,?,?,?) ON CONFLICT(account_id,symbol) DO UPDATE SET shares=excluded.shares,avg_cost=excluded.avg_cost,updated_at=excluded.updated_at",
+                                       (account_id,symbol,new_shares,avg,now))
                         else:
-                            requested=int(row["quantity"] or (held["shares"] if held else 0))
-                            filled=min(requested,capacity,int(held["shares"] if held else 0))
-                        if requested<=0:reason="below_board_lot_or_no_position"
-                        elif filled<=0:reason="cash_or_capacity_unavailable"
-                        else:
-                            value=filled*price;fee=self._fee(value,side);status="filled" if filled==requested else "partial";reason="ok" if status=="filled" else "volume_or_cash_limited"
-                            if side=="buy":
-                                cash-=value+fee
-                                old_shares=int(held["shares"]) if held else 0;old_cost=float(held["avg_cost"]) if held else 0
-                                new_shares=old_shares+filled;avg=(old_shares*old_cost+value+fee)/new_shares
-                                db.execute("INSERT INTO simulation_positions VALUES(?,?,?,?,?) ON CONFLICT(account_id,symbol) DO UPDATE SET shares=excluded.shares,avg_cost=excluded.avg_cost,updated_at=excluded.updated_at",
-                                           (account_id,symbol,new_shares,avg,now))
-                            else:
-                                cash+=value-fee;remaining=int(held["shares"])-filled
-                                if remaining:db.execute("UPDATE simulation_positions SET shares=?,updated_at=? WHERE account_id=? AND symbol=?",(remaining,now,account_id,symbol))
-                                else:db.execute("DELETE FROM simulation_positions WHERE account_id=? AND symbol=?",(account_id,symbol))
+                            cash+=value-fee;remaining=int(held["shares"])-filled
+                            if remaining:db.execute("UPDATE simulation_positions SET shares=?,updated_at=? WHERE account_id=? AND symbol=?",(remaining,now,account_id,symbol))
+                            else:db.execute("DELETE FROM simulation_positions WHERE account_id=? AND symbol=?",(account_id,symbol))
+                        if status=="partial":
+                            remainder=requested-filled
+                            continuation={**payload,"parent_ledger_id":row["id"],
+                                          "requested_quantity":remainder,"continuation":True}
+                            db.execute(
+                                "INSERT OR IGNORE INTO simulation_ledger(run_key,event_time,effective_at,event_type,symbol,quantity,price,amount,fee,status,payload) "
+                                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                                (row["run_key"],now,row["effective_at"],f"intent_{side}_remainder_{row['id']}",
+                                 symbol,remainder,None,None,0,"pending",json.dumps(continuation,ensure_ascii=False)),
+                            )
                 payload.update({"requested_quantity":requested,"filled_quantity":filled,"reason":reason,"broker_connected":False})
                 db.execute("UPDATE simulation_ledger SET quantity=?,price=?,amount=?,fee=?,status=?,payload=? WHERE id=?",
                            (filled,round(price,4) if price else None,round(value,2),round(fee,2),status,json.dumps(payload,ensure_ascii=False),row["id"]))
@@ -180,14 +265,19 @@ class SQLiteRepository:
         now=datetime.now().astimezone().isoformat()
         with self._lock,self.connect() as db:
             account=db.execute("SELECT * FROM simulation_accounts WHERE id=?",(account_id,)).fetchone()
-            positions=db.execute("SELECT symbol,shares FROM simulation_positions WHERE account_id=?",(account_id,)).fetchall()
-            cash=float(account["cash"]);market_value=sum(int(x["shares"])*closes.get(x["symbol"],0) for x in positions);equity=cash+market_value
+            positions=db.execute("SELECT symbol,shares,avg_cost FROM simulation_positions WHERE account_id=?",(account_id,)).fetchall()
+            missing_closes=[x["symbol"] for x in positions if x["symbol"] not in closes]
+            market_value=sum(int(x["shares"])*closes.get(x["symbol"],float(x["avg_cost"])) for x in positions)
+            cash=float(account["cash"]);equity=cash+market_value
             peak=max(float(account["peak_equity"]),equity);drawdown=equity/peak-1 if peak else 0
             db.execute("UPDATE simulation_accounts SET peak_equity=?,updated_at=? WHERE id=?",(peak,now,account_id))
-            db.execute("INSERT OR REPLACE INTO simulation_equity VALUES(?,?,?,?,?,?,?)",(trade_date,now,round(cash,2),round(market_value,2),round(equity,2),round(drawdown,6),json.dumps(payload,ensure_ascii=False)))
+            valuation_payload={**payload,"missing_closes":missing_closes,
+                               "fallback":"avg_cost" if missing_closes else None}
+            db.execute("INSERT OR REPLACE INTO simulation_equity VALUES(?,?,?,?,?,?,?)",(trade_date,now,round(cash,2),round(market_value,2),round(equity,2),round(drawdown,6),json.dumps(valuation_payload,ensure_ascii=False)))
         # Explicit accounting invariant, with cent-level tolerance.
         assert abs((cash+market_value)-equity)<.01
-        return {"cash":round(cash,2),"market_value":round(market_value,2),"equity":round(equity,2),"drawdown":round(drawdown,6)}
+        return {"cash":round(cash,2),"market_value":round(market_value,2),"equity":round(equity,2),"drawdown":round(drawdown,6),
+                "valuation_degraded":bool(missing_closes),"missing_closes":missing_closes}
 
     def simulation(self) -> dict:
         with self.connect() as db:

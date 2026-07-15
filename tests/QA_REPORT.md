@@ -8,7 +8,8 @@
 
 此节覆盖下方初检时仍存在的工程缺口：
 
-- Python 后端、PIT、公开 provider 契约、研究、模拟账务、集成及运维测试现为 **90 passed**；前端 **22 passed**，生产构建通过。
+- Python 后端、PIT、公开 provider 契约、研究、模拟账务、集成及运维测试现为 **129 passed**；前端 **27 passed**，TypeScript 与 Vite 生产构建通过。
+- 新增完成级验收覆盖：弱市15%单股下限、题材入场阶段、严格回踩确认、独立2～3只备选池、设置/模拟本金跨重启一致、受保护写接口、结构化OpenAPI、日终与回测共用退出状态机、组合回撤冷却、最终测试隔离、Linux每日备份。
 - 产业链以行业风险簇作为MVP保守代理，聚合目标权重硬限制为45%，已纳入领域测试。
 - PIT层已实现原始批次三层SHA-256、`effective_at/published_at/available_at`、as-of重建、历史上市/退市及题材成员、未来财务/公告隔离；授权CSV bundle未提供真实数据时仍强制门禁失败。
 - 研究API已生成不可变manifest/hash、严格时间切分和最终测试段、三基线、四资金档、9宫格敏感性、共享引擎因子消融、压力场景和gates；Demo运行固定标记 `FAIL / 工程候选版`。
@@ -20,12 +21,12 @@
 
 ## 验收环境
 
-- Git commit：不可用（当前目录不是 Git worktree）
+- Git 基线：`9a401d1`；本轮完成级修改在最终提交前以工作树差异验收
 - Python：3.11.14（独立 `.qa-venv`）
 - Node / npm：20.19.3 / 10.8.2
 - `uv.lock` SHA-256：`0081A2A8E980C13E3F17FB05CA552CC67A5D7F2B1054720FFBE0F52796531A76`
 - `package-lock.json` SHA-256：`6FD8B53BDEFBC1FB7CAB7BF381F4A01DE77DFC03D2B5BF45D050A1725775768B`
-- 时区：Asia/Shanghai；Demo provider：`deterministic-demo`；模型：`swing-rules-0.2.1`
+- 时区：Asia/Shanghai；Demo provider：`deterministic-demo`；模型：`swing-rules-0.3.0`
 
 ## 需求—证据矩阵
 
@@ -33,7 +34,7 @@
 |---|---|---|---|
 | BND-001～005 | 无券商、真实订单、交易凭据或自动交易入口；持续风险提示；默认 A 股范围 | 路由/代码/文案扫描、API 与 UI 测试 | **PASS（工程边界）**：无 broker/orders/execute 路由；UI/API 明示不自动交易；默认排除北交所 |
 | PRT-001～009 | 10万～1000万；0～5只；默认4只；单股≤25%；3只现金≥25%；同题材≤2；产业链≤45%；周替换≤1 | 参数化领域测试、API JSON、不变量测试 | **PASS（工程规则）**：四资金档、数量、单股、现金、同题材、产业链代理、总仓位、partial/risk_off原因及周替换节流均已测；真实长期表现仍归入模拟观察门禁 |
-| DAT-001～009 | Provider 契约、PIT、provenance、质量门禁、stale/demo 明示 | Provider/质量/API/UI 状态测试 | **PASS（工程防线）/ FAIL（生产数据）**：demo/csv/licensed-csv 契约、bundle 哈希、授权/PIT 声明、as-of 重建、历史证券/题材成员与新鲜度门禁已实现；Tushare覆盖120日OHLCV、逐日复权、行业回退、估值/指数代理与显式降级，AKShare覆盖显式股票池的前复权和行业快照；两者只允许`observation_only`，错误配置/复权/覆盖/分组/新鲜度失败均不回退Demo，token不进入状态或异常链；但尚未取得真实授权PIT bundle，当前环境实际AKShare联网探测受上游TLS失败阻断 |
+| DAT-001～009 | Provider 契约、PIT、provenance、质量门禁、stale/demo 明示 | Provider/质量/API/UI 状态测试 | **PASS（工程防线）/ FAIL（生产数据）**：demo/csv/licensed-csv 契约、bundle 哈希、授权/PIT 声明、as-of 重建、历史证券/题材成员与新鲜度门禁已实现；Tushare覆盖120日OHLCV、逐日复权、行业回退、估值/指数代理与显式降级，AKShare覆盖显式股票池的前复权、行业快照、公开跨市场代理与逐项降级审计；两者只允许`observation_only`，错误配置/复权/覆盖/分组/新鲜度失败均不回退Demo，token不进入状态或异常链；服务器已验证东方财富失败时切换新浪前复权，但仍未取得真实授权PIT bundle |
 | MKT-001～004 | 六分项权重、五状态、仓位区间、原因与完整性 | 手算 fixture、状态边界测试 | **PASS（工程规则）**：六分项、五状态、仓位区间、原因与过期/缺失降级路径已覆盖；真实全球/宏观口径需随生产数据供应商锁定 |
 | THM-001～005 | 题材权重/生命周期/拥挤；资金代理口径；新闻不直接触发 | 单元测试、API/文案审计 | **PASS（工程规则）**：题材评分、生命周期、拥挤惩罚、成交结构等资金代理和新闻隔离边界已实现；生产口径需真实数据 provenance 支撑 |
 | STK-001～003 | 全部硬过滤、评分可复算、门槛失败原因 | 参数化过滤与评分测试 | **PASS（工程规则）**：ST、退市、监管、审计、事件窗口、停牌、上市天数、流动性与容量过滤均已纳入测试 |
@@ -41,7 +42,7 @@
 | BT-001～008 | 共用策略、T+1、费用/滑点/取整/不可成交、OOS/基线/门禁 | 单元、golden、报告与 gates JSON | **PASS（工程框架）/ FAIL（策略验收）**：共享策略、T+1、成本/限制、时间切分、基线、资金档、敏感性、消融、压力和 gates 制品已实现；仍缺真实历史PIT和最终隔离样本外通过证据 |
 | SIM-001～003 | 模拟意图/成交、账务守恒、幂等、版本不可覆盖 | API/领域/台账测试 | **PASS（工程台账）/ FAIL（观察期）**：意图、下一交易日撮合、买卖/部分/拒绝、费用、账务守恒、重启、幂等与版本隔离已测；真实8～12周连续观察尚未完成 |
 | AUD-001～002 | 决策回放、追加写、普通 API 不可修改/删除 | 路由与回放测试 | **PASS**：决策快照持久化、重启恢复、只读 API、幂等 run、在线备份与隔离恢复校验均已测 |
-| UI-001～009 | 核心流程、全状态、360/768/1440、键盘/44px/reduced motion/WCAG、数据新鲜度 | Vitest、构建、静态审计与浏览器验证 | **PARTIAL**：21/21组件/状态/a11y测试与构建通过；首页/设置/风险/回测 axe critical/serious=0，覆盖 partial/risk-off/stale/provider failure、焦点、label、44px；390/768/1440浏览器无横向溢出；仍缺读屏与浏览器像素级对比度实测 |
+| UI-001～009 | 核心流程、全状态、360/768/1440、键盘/44px/reduced motion/WCAG、数据新鲜度 | Vitest、构建、静态审计与浏览器验证 | **PARTIAL**：27/27组件、API边界、状态与a11y测试及构建通过；首页/设置/风险/回测 axe critical/serious=0，覆盖模型/模拟分账、partial/risk-off/stale/provider failure、焦点、label、44px；390/768/1440浏览器无横向溢出；仍缺读屏与浏览器像素级对比度实测 |
 | NFR-001～006 | 决定性、契约单位/时间、密钥/日志、幂等、备份恢复、健康降级 | 测试、扫描、运行手册/恢复证据 | **PASS（工程运维）**：决定性、统一错误结构、持久幂等、`health/live|ready`、设置接口、备份与只读恢复校验已测；真实生产演练待上线环境执行 |
 
 ## 高风险专项检查
@@ -106,10 +107,10 @@
 
 ```text
 .\scripts\test.ps1
-90 Python/集成/数据/研究/运维测试 passed, 1 upstream deprecation warning
+129 Python/集成/数据/研究/运维测试 passed, 1 upstream deprecation warning
 
 npm test -- --run
-22 passed（含公开观察边界与四个关键整页 axe critical/serious=0；color-contrast 因 jsdom 无像素引擎排除）
+27 passed（含模型/模拟分账、管理密钥请求、公开观察边界与四个关键整页 axe critical/serious=0；color-contrast 因 jsdom 无像素引擎排除）
 
 npm run build
 vite build: 26 modules; JS 263.67 kB (gzip 85.12 kB); CSS 16.21 kB (gzip 4.06 kB)

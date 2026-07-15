@@ -1,19 +1,31 @@
 from __future__ import annotations
 from datetime import date
 import os
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+import secrets
+from typing import Any
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Security
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from starlette.exceptions import HTTPException as StarletteHTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from quant_system.models import jsonable
 from quant_system.engine import MODEL_VERSION
 from quant_system.research_service import read_research_artifact, read_research_run, run_research_package
 from quant_system.service import QuantService
 from quant_system.providers import provider_from_env
 
-app=FastAPI(title="A股中期波段精选系统 API",version="0.1.0",description="研究、解释、回测与模拟组合；不包含自动交易。")
+app=FastAPI(title="A股中期波段精选系统 API",version="0.3.0",description="研究、解释、回测与模拟组合；不包含自动交易。")
 service=QuantService(provider=provider_from_env())
+admin_key_header=APIKeyHeader(name="X-Admin-Key",auto_error=False,description="个人管理密钥；仅用于设置、日终和研究写操作")
+
+def require_admin(key:str|None=Security(admin_key_header)):
+    configured=os.getenv("QUANT_ADMIN_API_KEY","").strip()
+    # Local development remains frictionless when no key is configured.  The
+    # deployment profile always sets a key and therefore fails closed.
+    if configured and (not key or not secrets.compare_digest(key,configured)):
+        raise HTTPException(401,"需要有效的个人管理密钥",headers={"WWW-Authenticate":"ApiKey"})
+    return True
 
 def error_body(request:Request,code:str,message:str,details=None):
     return {"error":{"code":code,"message":message,"details":details or [],"path":request.url.path}}
@@ -43,6 +55,9 @@ class SettingsPatch(BaseModel):
     include_chinext: bool|None=None
     include_star: bool|None=None
     include_bse: bool|None=None
+    notify_eod_success: bool|None=None
+    notify_risk: bool|None=None
+    notification_channel: str|None=Field(None,pattern="^(none|email|webhook)$")
 
 class PipelineRequest(BaseModel):
     as_of: date|None=None
@@ -55,13 +70,55 @@ class BacktestRequest(BaseModel):
 class ResearchRequest(BaseModel):
     capital: int=Field(1_000_000,ge=100_000,le=10_000_000)
 
-@app.get("/health")
+class ProductResponse(BaseModel):
+    model_config=ConfigDict(extra="allow")
+
+class DashboardResponse(ProductResponse):
+    as_of: str|None=None
+    provider: str|None=None
+    market: dict[str,Any]=Field(default_factory=dict)
+    portfolio: list[dict[str,Any]]=Field(default_factory=list)
+    candidates: list[dict[str,Any]]=Field(default_factory=list)
+    cash_weight: float=1.0
+
+class PortfolioResponse(ProductResponse):
+    positions: list[dict[str,Any]]=Field(default_factory=list)
+    cash_weight: float=1.0
+    model_portfolio_only: bool=True
+
+class DataStatusResponse(ProductResponse):
+    quality: dict[str,Any]=Field(default_factory=dict)
+    providers: list[dict[str,Any]]=Field(default_factory=list)
+    active: str=""
+    provenance: dict[str,Any]=Field(default_factory=dict)
+
+class SimulationResponse(ProductResponse):
+    simulated_account: dict[str,Any]|None=None
+    simulated_positions: list[dict[str,Any]]=Field(default_factory=list)
+    ledger: list[dict[str,Any]]=Field(default_factory=list)
+    daily_equity: list[dict[str,Any]]=Field(default_factory=list)
+
+class SettingsResponse(ProductResponse):
+    capital: float
+    target_count: int
+    max_portfolio_drawdown: float
+    risk_per_trade: float
+    include_main: bool
+    include_chinext: bool
+    include_star: bool
+    include_bse: bool
+    notify_eod_success: bool=True
+    notify_risk: bool=True
+    notification_channel: str="none"
+    automatic_trading: bool=False
+
+@app.get("/health",response_model=dict[str,Any])
 def health(): return {"status":"ok","service":"quant-api","automatic_trading":False}
 
-@app.get("/api/v1/health/live")
+@app.get("/api/v1/health/live",response_model=dict[str,Any])
 def live(): return {"status":"alive","service":"quant-api"}
 
-@app.get("/api/v1/health/ready")
+@app.get("/api/v1/health/ready",response_model=dict[str,Any])
 def ready():
     database=service.repository.ping(); active=service.provider.status(); provider=bool(active.get("available",False))
     latest=service.ensure() or {}; freshness=latest.get("quality",{}).get("freshness","unknown")
@@ -75,24 +132,24 @@ def ready():
           "last_successful_eod":latest.get("as_of") if latest.get("published") or latest.get("displayable") else None},"automatic_trading":False}
     return JSONResponse(body,status_code=200 if ready_state else 503)
 
-@app.get("/api/v1/dashboard")
+@app.get("/api/v1/dashboard",response_model=DashboardResponse)
 def dashboard(): return service.ensure()
 
-@app.get("/api/v1/market")
+@app.get("/api/v1/market",response_model=dict[str,Any])
 def market():
     d=service.ensure(); return {"as_of":d["as_of"],"quality":d["quality"],"market":d["market"]}
 
-@app.get("/api/v1/themes")
+@app.get("/api/v1/themes",response_model=dict[str,Any])
 def themes(): return {"items":service.ensure()["themes"],"as_of":service.ensure()["as_of"]}
 
-@app.get("/api/v1/portfolio")
+@app.get("/api/v1/portfolio",response_model=PortfolioResponse)
 def portfolio():
     d=service.ensure(); return {"positions":d["portfolio"],"cash_weight":d["cash_weight"],"model_portfolio_only":True,"disclaimer":d["disclaimer"]}
 
-@app.get("/api/v1/candidates")
+@app.get("/api/v1/candidates",response_model=dict[str,Any])
 def candidates(): return {"items":service.ensure()["candidates"]}
 
-@app.get("/api/v1/stocks/{symbol}")
+@app.get("/api/v1/stocks/{symbol}",response_model=dict[str,Any])
 def stock(symbol:str):
     d=service.ensure(require_snapshot=True); all_items=d["portfolio"]+d["candidates"]
     item=next((x for x in all_items if x["symbol"].upper()==symbol.upper()),None)
@@ -100,38 +157,38 @@ def stock(symbol:str):
     bars=[jsonable(b) for b in service.snapshot.bars if b.symbol.upper()==symbol.upper()]
     return {"stock":item,"bars":bars[-90:],"provenance":{"provider":d["provider"],"data_timestamp":d["as_of"],"model_version":MODEL_VERSION}}
 
-@app.get("/api/v1/decisions")
+@app.get("/api/v1/decisions",response_model=dict[str,Any])
 def decisions(limit:int=Query(20,ge=1,le=100)): return {"items":[{k:v for k,v in x.items() if k!="snapshot"} for x in service.repository.list_decisions(limit)]}
 
-@app.get("/api/v1/decisions/{decision_id}")
+@app.get("/api/v1/decisions/{decision_id}",response_model=dict[str,Any])
 def decision(decision_id:str):
     x=service.repository.get_decision(decision_id)
     if not x: raise HTTPException(404,"决策记录不存在")
     return x
 
-@app.get("/api/v1/data/status")
+@app.get("/api/v1/data/status",response_model=DataStatusResponse)
 def data_status():
     d=service.ensure(); return {"quality":d["quality"],"providers":service.provider_statuses(),"active":d["provider"],
                                 "provenance":d.get("data_provenance",{})}
 
-@app.post("/api/v1/pipeline/eod")
+@app.post("/api/v1/pipeline/eod",response_model=dict[str,Any],dependencies=[Security(require_admin)])
 def pipeline(req:PipelineRequest,idempotency_key:str|None=Header(None,alias="Idempotency-Key"),x_idempotency_key:str|None=Header(None,alias="X-Idempotency-Key")):
     return service.run_eod(req.as_of,enforce_freshness=req.enforce_freshness,run_key=idempotency_key or x_idempotency_key or req.run_key)
 
-@app.post("/api/v1/backtests",status_code=201)
+@app.post("/api/v1/backtests",status_code=201,response_model=dict[str,Any],dependencies=[Security(require_admin)])
 def create_backtest(req:BacktestRequest):
     ident,result=service.run_backtest(req.capital); return {"id":ident,"status":result["status"],"result":result}
 
-@app.get("/api/v1/backtests")
+@app.get("/api/v1/backtests",response_model=dict[str,Any])
 def list_backtests(): return {"items":service.repository.list_backtests()}
 
-@app.get("/api/v1/backtests/{backtest_id}")
+@app.get("/api/v1/backtests/{backtest_id}",response_model=dict[str,Any])
 def backtest(backtest_id:str):
     result=service.repository.get_backtest(backtest_id)
     if result is None:raise HTTPException(404,"回测不存在")
     return result
 
-@app.post("/api/v1/research/runs",status_code=201)
+@app.post("/api/v1/research/runs",status_code=201,response_model=dict[str,Any],dependencies=[Security(require_admin)])
 def create_research_run(req:ResearchRequest):
     service.ensure(require_snapshot=True)
     simulation=service.simulation().get("daily_equity",[])
@@ -140,30 +197,33 @@ def create_research_run(req:ResearchRequest):
         weeks=max(0.0,(date.fromisoformat(simulation[-1]["day"])-date.fromisoformat(simulation[0]["day"])).days/7)
     return run_research_package(service.snapshot,os.getenv("QUANT_RESEARCH_PATH","data/research"),capital=req.capital,simulation_weeks=weeks)
 
-@app.get("/api/v1/research/runs/{run_id}")
+@app.get("/api/v1/research/runs/{run_id}",response_model=dict[str,Any])
 def research_run(run_id:str):
     result=read_research_run(run_id,os.getenv("QUANT_RESEARCH_PATH","data/research"))
     if result is None: raise HTTPException(404,"研究运行不存在")
     return result
 
-@app.get("/api/v1/research/runs/{run_id}/artifacts/{artifact}")
+@app.get("/api/v1/research/runs/{run_id}/artifacts/{artifact}",response_model=dict[str,Any])
 def research_artifact(run_id:str,artifact:str):
     filename=artifact if artifact.endswith(".json") else f"{artifact}.json"
     result=read_research_artifact(run_id,filename,os.getenv("QUANT_RESEARCH_PATH","data/research"))
     if result is None: raise HTTPException(404,"研究制品不存在")
     return result
 
-@app.get("/api/v1/simulation")
+@app.get("/api/v1/simulation",response_model=SimulationResponse)
 def simulation():
     d=service.ensure(); ledger=service.simulation(); return {"status":"active","name":"MVP 模型组合","started_at":d["as_of"],"positions":d["portfolio"],
        "cash_weight":d["cash_weight"],"orders_sent":0,"broker_connected":False,"simulated_account":ledger["account"],"simulated_positions":ledger["positions"],"ledger":ledger["ledger"],"daily_equity":ledger["daily_equity"],
        "note":"仅记录下一交易日模型意图和模拟台账，不触达券商。"}
 
-@app.get("/api/v1/settings")
+@app.get("/api/v1/settings",response_model=SettingsResponse)
 def get_settings(): return jsonable(service.settings)
 
-@app.patch("/api/v1/settings")
+@app.patch("/api/v1/settings",response_model=SettingsResponse,dependencies=[Security(require_admin)])
 def patch_settings(patch:SettingsPatch):
-    for key,value in patch.model_dump(exclude_none=True).items():setattr(service.settings,key,value)
-    service.latest=None
-    return jsonable(service.settings)
+    try:return service.update_settings(patch.model_dump(exclude_none=True))
+    except ValueError as exc:raise HTTPException(409,str(exc)) from exc
+
+@app.get("/api/v1/settings/audit",response_model=dict[str,Any],dependencies=[Security(require_admin)])
+def settings_audit(limit:int=Query(20,ge=1,le=100)):
+    return {"items":service.repository.list_settings_audit(limit=limit)}

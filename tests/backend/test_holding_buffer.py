@@ -75,3 +75,35 @@ def test_hard_risk_is_exempt_and_risk_off_can_exit_all(tmp_path):
     empty,audit=service._buffered_portfolio(snap,riskoff,stocks)
     assert empty==[] and audit["exception"]=="risk_off"
     assert len(audit["replaced"])==len(OLD)
+
+
+def test_trailing_profit_exit_cannot_be_reselected_in_the_same_eod_run(tmp_path):
+    service,snap,market,stocks=context(tmp_path)
+    previous=prior()
+    previous["snapshot"]["portfolio"][0].update({
+        "entry_price":100.0,"highest_price":300.0,"initial_stop":90.0,
+        "protective_price":240.0,"entry_at":"2026-04-01T09:30:00+08:00",
+    })
+    service.decisions=[previous]
+
+    portfolio,turnover=service._buffered_portfolio(snap,market,stocks)
+
+    exited=[item for item in turnover["replaced"] if item["kind"]=="risk_exit"]
+    assert exited and exited[0]["symbol"]==OLD[0]
+    assert "回吐30%" in exited[0]["reason"]
+    assert OLD[0] not in {item.symbol for item in portfolio}
+
+
+def test_configured_portfolio_drawdown_hard_stop_exits_to_cash(tmp_path):
+    service,snap,market,stocks=context(tmp_path)
+    service.settings.max_portfolio_drawdown=.15
+    service.decisions=[prior()]
+
+    portfolio,turnover=service._buffered_portfolio(
+        snap,market,stocks,portfolio_drawdown=-.16,
+    )
+
+    risk_exits=[item for item in turnover["replaced"] if item["kind"]=="risk_exit"]
+    assert portfolio==[]
+    assert {item["symbol"] for item in risk_exits}==set(OLD)
+    assert all("15%" in item["reason"] for item in risk_exits)

@@ -21,11 +21,12 @@ class Frame:
 
 class FakeAkshare:
     def __init__(self, end: date, *, missing_industry: bool = False, invalid_ohlc: bool = False,
-                 metadata_failure: bool = False):
+                 metadata_failure: bool = False, history_failure: bool = False):
         self.end = end
         self.missing_industry = missing_industry
         self.invalid_ohlc = invalid_ohlc
         self.metadata_failure = metadata_failure
+        self.history_failure = history_failure
         self.history_calls: list[dict] = []
 
     def stock_individual_info_em(self, **kwargs):
@@ -40,6 +41,18 @@ class FakeAkshare:
 
     def stock_zh_a_hist(self, **kwargs):
         self.history_calls.append(kwargs)
+        if self.history_failure:
+            raise ConnectionError("eastmoney history unavailable")
+        return self._history_records()
+
+    def stock_zh_a_daily(self, **kwargs):
+        self.history_calls.append(kwargs)
+        records = self._history_records()
+        return Frame([{"date": row["日期"], "open": row["开盘"], "close": row["收盘"],
+                       "high": row["最高"], "low": row["最低"],
+                       "volume": row["成交量"], "amount": row["成交额"]} for row in records.records])
+
+    def _history_records(self):
         records = []
         for offset in range(65):
             day = self.end - timedelta(days=64 - offset)
@@ -54,7 +67,8 @@ class FakeAkshare:
 
 def install(monkeypatch, fake: FakeAkshare) -> None:
     module = SimpleNamespace(stock_individual_info_em=fake.stock_individual_info_em,
-                             stock_zh_a_hist=fake.stock_zh_a_hist)
+                             stock_zh_a_hist=fake.stock_zh_a_hist,
+                             stock_zh_a_daily=fake.stock_zh_a_daily)
     monkeypatch.setitem(sys.modules, "akshare", module)
 
 
@@ -69,6 +83,7 @@ def test_akshare_qfq_observation_snapshot_has_strict_enrichment_contract(monkeyp
     assert all(bar.name == "平安银行" for bar in snapshot.bars)
     assert all(bar.industry == "银行" and bar.theme == "银行" for bar in snapshot.bars)
     assert all(bar.adj_factor == 1.0 and bar.quality == 50 and bar.catalyst == 50 for bar in snapshot.bars)
+    assert all(bar.volume == 100_000_000 for bar in snapshot.bars)
     assert fake.history_calls[0]["adjust"] == "qfq"
     assert fake.history_calls[0]["period"] == "daily"
     assert snapshot.metadata["observation_only"] is True
@@ -144,6 +159,22 @@ def test_akshare_metadata_fallback_still_blocks_if_requested_symbol_is_missing(m
     with pytest.raises(RuntimeError, match="configured metadata is missing.*observation is blocked"):
         AkshareProvider(("000001.SZ",), metadata_path=metadata).load(date.today())
     assert fake.history_calls == []
+
+
+def test_akshare_sina_qfq_fallback_is_audited_and_preserves_share_volume(monkeypatch):
+    end = date.today()
+    fake = FakeAkshare(end, history_failure=True)
+    install(monkeypatch, fake)
+
+    snapshot = AkshareProvider(("000001.SZ",)).load(end)
+
+    assert len(snapshot.bars) == 65
+    assert all(bar.volume == 1_000_000 for bar in snapshot.bars)
+    assert fake.history_calls[0]["symbol"] == "000001"
+    assert fake.history_calls[1]["symbol"] == "sz000001"
+    assert snapshot.metadata["price_history"]["sources"] == {"000001.SZ": "sina_qfq_fallback"}
+    assert snapshot.metadata["price_history"]["eastmoney_endpoint_available"] is False
+    assert snapshot.metadata["price_history"]["volume_unit"] == "shares"
 
 
 def test_akshare_factory_interval_validation_is_fail_closed(monkeypatch):

@@ -816,6 +816,15 @@ class AkshareProvider(MarketDataProvider):
                 result[symbol] = (name, industry, listed_at)
         return result
 
+    @staticmethod
+    def _sina_symbol(symbol: str) -> str:
+        code = symbol.split(".", 1)[0]
+        if code.startswith("6"):
+            return f"sh{code}"
+        if code.startswith(("0", "3")):
+            return f"sz{code}"
+        raise RuntimeError(f"AKShare Sina fallback does not support board for {symbol}; observation is blocked")
+
     def status(self) -> dict:
         try: import akshare  # noqa
         except ImportError: return {"provider": self.name, "available": False, "reason": "optional package not installed"}
@@ -839,6 +848,9 @@ class AkshareProvider(MarketDataProvider):
         metadata_sources: dict[str, str] = {}
         live_metadata_available = True
         live_metadata_error: str | None = None
+        history_sources: dict[str, str] = {}
+        eastmoney_history_available = True
+        eastmoney_history_error: str | None = None
         for symbol in self.symbols:
             if live_metadata_available:
                 try:
@@ -858,27 +870,42 @@ class AkshareProvider(MarketDataProvider):
                 metadata_sources[symbol] = "configured_static_fallback"
             if not industry:
                 raise RuntimeError(f"AKShare industry is unavailable for {symbol}; observation is blocked")
-            records = self._request(
-                ak, "stock_zh_a_hist", symbol=symbol.split(".", 1)[0], period="daily",
-                start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"), adjust="qfq",
-            )
+            dataset = "stock_zh_a_hist"
+            volume_multiplier = 100
+            if eastmoney_history_available:
+                try:
+                    records = self._request(
+                        ak, dataset, symbol=symbol.split(".", 1)[0], period="daily",
+                        start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"), adjust="qfq",
+                    )
+                    history_sources[symbol] = "eastmoney_qfq"
+                except RuntimeError as exc:
+                    eastmoney_history_available = False
+                    eastmoney_history_error = str(exc)
+            if not eastmoney_history_available:
+                dataset = "stock_zh_a_daily"
+                volume_multiplier = 1
+                records = self._request(
+                    ak, dataset, symbol=self._sina_symbol(symbol),
+                    start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"), adjust="qfq",
+                )
+                history_sources[symbol] = "sina_qfq_fallback"
             if not records:
                 raise RuntimeError(f"AKShare qfq history is empty for {symbol}; observation is blocked")
             symbol_bars: list[Bar] = []
             seen_days: set[date] = set()
             for row in records:
-                day = self._day(self._value(row, ("日期", "date"), dataset="stock_zh_a_hist"),
-                                dataset="stock_zh_a_hist")
+                day = self._day(self._value(row, ("日期", "date"), dataset=dataset), dataset=dataset)
                 if day > end or day in seen_days:
                     raise RuntimeError(f"AKShare qfq history has an invalid or duplicate date for {symbol}; observation is blocked")
                 seen_days.add(day)
                 try:
-                    op = float(self._value(row, ("开盘", "open"), dataset="stock_zh_a_hist"))
-                    close = float(self._value(row, ("收盘", "close"), dataset="stock_zh_a_hist"))
-                    high = float(self._value(row, ("最高", "high"), dataset="stock_zh_a_hist"))
-                    low = float(self._value(row, ("最低", "low"), dataset="stock_zh_a_hist"))
-                    volume = int(float(self._value(row, ("成交量", "volume"), dataset="stock_zh_a_hist")))
-                    amount = float(self._value(row, ("成交额", "amount"), dataset="stock_zh_a_hist"))
+                    op = float(self._value(row, ("开盘", "open"), dataset=dataset))
+                    close = float(self._value(row, ("收盘", "close"), dataset=dataset))
+                    high = float(self._value(row, ("最高", "high"), dataset=dataset))
+                    low = float(self._value(row, ("最低", "low"), dataset=dataset))
+                    volume = int(float(self._value(row, ("成交量", "volume"), dataset=dataset)) * volume_multiplier)
+                    amount = float(self._value(row, ("成交额", "amount"), dataset=dataset))
                 except (TypeError, ValueError, OverflowError):
                     raise RuntimeError(f"AKShare qfq history has non-numeric values for {symbol}; observation is blocked") from None
                 numeric = (op, close, high, low, float(volume), amount)
@@ -913,6 +940,12 @@ class AkshareProvider(MarketDataProvider):
                                           "live_endpoint_error": live_metadata_error,
                                           "configured_file": self.metadata_path.name if self.metadata_path else None,
                                           "warning": "静态元数据仅用于显式观察池身份/行业回退，不是PIT历史成分"},
+                    "price_history": {"sources": history_sources,
+                                      "eastmoney_endpoint_available": eastmoney_history_available,
+                                      "eastmoney_endpoint_error": eastmoney_history_error,
+                                      "adjustment": "qfq",
+                                      "volume_unit": "shares",
+                                      "warning": "东方财富失败时切换至AKShare新浪前复权日线；实际来源逐标的审计"},
                     "enrichments": {"adj_factor": {"status": "available", "method": "provider_qfq",
                                                     "rows": len(bars), "missing_bar_rows": 0,
                                                     "warning": "接口直接返回前复权价格，不提供可审计的逐日原始复权因子"},

@@ -36,7 +36,7 @@ $env:QUANT_TUSHARE_MIN_REQUEST_INTERVAL_SECONDS = "1.25"
 .\scripts\eod.ps1 -AsOf 2026-07-10 -EnforceFreshness
 ```
 
-`tushare` 会严格拒绝非 SSE 交易日，拉取最近 120 个交易日的全市场日线、逐日复权因子、行业和可选估值/指数代理，并记录其为公开、非 PIT 数据。缺 token、缺可选依赖、核心接口不可用或数据不完整会失败，不会回退为 Demo。`akshare` 只允许明确指定范围：`QUANT_DATA_PROVIDER=akshare` 加 `QUANT_AKSHARE_SYMBOLS=600519.SH,000001.SZ`；它使用前复权行情和当前行业快照，行业/历史/OHLC 任一不完整即阻止观察。公开接口数据可用于本地研究和前瞻模拟观察，但不具备历史成分、发布时间、修订版本和商业授权证据，不能作为生产研究门禁的通过依据。
+`tushare` 会严格拒绝非 SSE 交易日，拉取最近 120 个交易日的全市场日线、逐日复权因子、行业和可选估值/指数代理，并记录其为公开、非 PIT 数据。缺 token、缺可选依赖、核心接口不可用或数据不完整会失败，不会回退为 Demo。`akshare` 只允许明确指定范围：`QUANT_DATA_PROVIDER=akshare` 加 `QUANT_AKSHARE_SYMBOLS=600519.SH,000001.SZ`；它使用前复权行情和当前行业快照，行业/历史/OHLC 任一不完整即阻止观察。服务器机房无法访问实时个股元数据时，可设置 `QUANT_AKSHARE_METADATA_PATH=deploy/akshare-universe.csv`；文件必须包含 `symbol,name,industry,list_date`，缺失请求标的或字段会失败关闭，实际回退来源写入 `security_metadata` 审计。公开接口数据可用于本地研究和前瞻模拟观察，但不具备历史成分、发布时间、修订版本和商业授权证据，不能作为生产研究门禁的通过依据。
 
 ## 3. 首次启动检查表
 

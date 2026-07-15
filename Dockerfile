@@ -12,6 +12,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 COPY apps/__init__.py ./apps/__init__.py
 COPY apps/api ./apps/api
+COPY deploy/akshare-universe.csv ./config/akshare-universe.csv
 
 RUN python -m pip install --index-url "${PIP_INDEX_URL}" --upgrade pip \
     && python -m pip install --index-url "${PIP_INDEX_URL}" ".[providers]"

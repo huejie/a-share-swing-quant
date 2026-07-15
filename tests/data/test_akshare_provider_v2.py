@@ -20,13 +20,17 @@ class Frame:
 
 
 class FakeAkshare:
-    def __init__(self, end: date, *, missing_industry: bool = False, invalid_ohlc: bool = False):
+    def __init__(self, end: date, *, missing_industry: bool = False, invalid_ohlc: bool = False,
+                 metadata_failure: bool = False):
         self.end = end
         self.missing_industry = missing_industry
         self.invalid_ohlc = invalid_ohlc
+        self.metadata_failure = metadata_failure
         self.history_calls: list[dict] = []
 
     def stock_individual_info_em(self, **kwargs):
+        if self.metadata_failure:
+            raise ConnectionError("upstream closed connection")
         assert kwargs["symbol"] == "000001"
         return Frame([
             {"item": "股票简称", "value": "平安银行"},
@@ -105,6 +109,41 @@ def test_akshare_invalid_qfq_ohlc_blocks_observation(monkeypatch):
     with pytest.raises(RuntimeError, match="invalid OHLCV.*observation is blocked"):
         AkshareProvider(("000001.SZ",)).load(date.today())
     assert fake.history_calls[0]["adjust"] == "qfq"
+
+
+def test_akshare_explicit_metadata_fallback_is_audited_when_live_metadata_fails(monkeypatch, tmp_path):
+    end = date.today()
+    fake = FakeAkshare(end, metadata_failure=True)
+    install(monkeypatch, fake)
+    metadata = tmp_path / "universe.csv"
+    metadata.write_text(
+        "symbol,name,industry,list_date\n000001.SZ,平安银行,银行,1991-04-03\n",
+        encoding="utf-8",
+    )
+
+    snapshot = AkshareProvider(("000001.SZ",), metadata_path=metadata).load(end)
+
+    assert {bar.name for bar in snapshot.bars} == {"平安银行"}
+    assert {bar.industry for bar in snapshot.bars} == {"银行"}
+    audit = snapshot.metadata["security_metadata"]
+    assert audit["live_endpoint_available"] is False
+    assert audit["live_endpoint_error"] == "AKShare stock_individual_info_em request failed"
+    assert audit["sources"] == {"000001.SZ": "configured_static_fallback"}
+    assert snapshot.metadata["theme_mapping"]["status"] == "industry_fallback"
+
+
+def test_akshare_metadata_fallback_still_blocks_if_requested_symbol_is_missing(monkeypatch, tmp_path):
+    fake = FakeAkshare(date.today(), metadata_failure=True)
+    install(monkeypatch, fake)
+    metadata = tmp_path / "universe.csv"
+    metadata.write_text(
+        "symbol,name,industry,list_date\n600519.SH,贵州茅台,白酒,2001-08-27\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="configured metadata is missing.*observation is blocked"):
+        AkshareProvider(("000001.SZ",), metadata_path=metadata).load(date.today())
+    assert fake.history_calls == []
 
 
 def test_akshare_factory_interval_validation_is_fail_closed(monkeypatch):

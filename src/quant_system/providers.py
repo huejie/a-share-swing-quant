@@ -711,11 +711,13 @@ class TushareProvider(MarketDataProvider):
 class AkshareProvider(MarketDataProvider):
     name = "akshare"
 
-    def __init__(self, symbols: tuple[str, ...] = (), *, min_request_interval_seconds: float = 0.0,
+    def __init__(self, symbols: tuple[str, ...] = (), *, metadata_path: str | Path | None = None,
+                 min_request_interval_seconds: float = 0.0,
                  sleeper=clock_time.sleep, clock=clock_time.monotonic):
         if min_request_interval_seconds < 0:
             raise ValueError("AKShare minimum request interval cannot be negative")
         self.symbols = symbols
+        self.metadata_path = Path(metadata_path) if metadata_path else None
         self.min_request_interval_seconds = min_request_interval_seconds
         self._sleeper = sleeper
         self._clock = clock
@@ -791,11 +793,35 @@ class AkshareProvider(MarketDataProvider):
         name = str(name_value).strip() if name_value is not None and str(name_value).strip() else symbol
         return name, industry, listed_at
 
+    def _configured_security_metadata(self) -> dict[str, tuple[str, str, date]]:
+        if self.metadata_path is None:
+            return {}
+        if not self.metadata_path.is_file():
+            raise RuntimeError(f"AKShare configured metadata file does not exist: {self.metadata_path}")
+        result: dict[str, tuple[str, str, date]] = {}
+        with self.metadata_path.open(encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            required = {"symbol", "name", "industry", "list_date"}
+            if not reader.fieldnames or not required.issubset(reader.fieldnames):
+                raise RuntimeError("AKShare configured metadata must contain symbol,name,industry,list_date")
+            for row in reader:
+                symbol = str(row.get("symbol") or "").strip().upper()
+                name = str(row.get("name") or "").strip()
+                industry = str(row.get("industry") or "").strip()
+                if not symbol or not name or not industry:
+                    raise RuntimeError("AKShare configured metadata contains an empty required value")
+                if symbol in result:
+                    raise RuntimeError(f"AKShare configured metadata contains duplicate symbol {symbol}")
+                listed_at = self._day(row.get("list_date"), dataset="configured_security_metadata")
+                result[symbol] = (name, industry, listed_at)
+        return result
+
     def status(self) -> dict:
         try: import akshare  # noqa
         except ImportError: return {"provider": self.name, "available": False, "reason": "optional package not installed"}
         return {"provider": self.name, "available": True, "observation_only": True,
                 "production_ready": False, "pit_verified": False,
+                "metadata_fallback_configured": self.metadata_path is not None,
                 "min_request_interval_seconds": self.min_request_interval_seconds,
                 "warning": "前复权行情仅供前瞻观察；网页接口未证明PIT、历史成分或商业授权"}
 
@@ -809,8 +835,27 @@ class AkshareProvider(MarketDataProvider):
         start = end - timedelta(days=260)
         bars: list[Bar] = []
         history_counts: dict[str, int] = {}
+        configured_metadata = self._configured_security_metadata()
+        metadata_sources: dict[str, str] = {}
+        live_metadata_available = True
+        live_metadata_error: str | None = None
         for symbol in self.symbols:
-            name, industry, listed_at = self._security_info(ak, symbol)
+            if live_metadata_available:
+                try:
+                    name, industry, listed_at = self._security_info(ak, symbol)
+                    metadata_sources[symbol] = "stock_individual_info_em"
+                except RuntimeError as exc:
+                    live_metadata_available = False
+                    live_metadata_error = str(exc)
+            if not live_metadata_available:
+                fallback = configured_metadata.get(symbol)
+                if fallback is None:
+                    raise RuntimeError(
+                        f"AKShare live metadata is unavailable for {symbol}: {live_metadata_error}; "
+                        "configured metadata is missing; observation is blocked"
+                    ) from None
+                name, industry, listed_at = fallback
+                metadata_sources[symbol] = "configured_static_fallback"
             if not industry:
                 raise RuntimeError(f"AKShare industry is unavailable for {symbol}; observation is blocked")
             records = self._request(
@@ -859,9 +904,15 @@ class AkshareProvider(MarketDataProvider):
                     "research_eligible": False, "production_ready": False,
                     "pit_verified": False, "pit_reconstruction": False, "authorization": False,
                     "simulation_matching_ready": False,
-                    "theme_mapping": {"status": "industry_fallback", "source": "stock_individual_info_em.行业",
+                    "theme_mapping": {"status": "industry_fallback",
+                                      "source": "stock_individual_info_em.行业 + 显式静态元数据回退" if not live_metadata_available else "stock_individual_info_em.行业",
                                       "missing_symbols": 0,
                                       "warning": "当前行业快照仅作题材分组回退，不具备历史PIT成分"},
+                    "security_metadata": {"sources": metadata_sources,
+                                          "live_endpoint_available": live_metadata_available,
+                                          "live_endpoint_error": live_metadata_error,
+                                          "configured_file": self.metadata_path.name if self.metadata_path else None,
+                                          "warning": "静态元数据仅用于显式观察池身份/行业回退，不是PIT历史成分"},
                     "enrichments": {"adj_factor": {"status": "available", "method": "provider_qfq",
                                                     "rows": len(bars), "missing_bar_rows": 0,
                                                     "warning": "接口直接返回前复权价格，不提供可审计的逐日原始复权因子"},
@@ -926,5 +977,9 @@ def provider_from_env(environ: dict[str, str] | None = None) -> MarketDataProvid
             raise RuntimeError("QUANT_AKSHARE_MIN_REQUEST_INTERVAL_SECONDS must be a non-negative number") from exc
         if interval < 0:
             raise RuntimeError("QUANT_AKSHARE_MIN_REQUEST_INTERVAL_SECONDS must be a non-negative number")
-        return AkshareProvider(symbols, min_request_interval_seconds=interval)
+        raw_metadata = env.get("QUANT_AKSHARE_METADATA_PATH", "").strip()
+        metadata_path = Path(raw_metadata) if raw_metadata else None
+        if metadata_path is not None and not metadata_path.is_file():
+            raise RuntimeError(f"configured AKShare metadata does not exist: {metadata_path}")
+        return AkshareProvider(symbols, metadata_path=metadata_path, min_request_interval_seconds=interval)
     raise RuntimeError(f"unsupported QUANT_DATA_PROVIDER={kind!r}; expected demo, csv, licensed-csv, tushare, or akshare")

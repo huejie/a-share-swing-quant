@@ -258,7 +258,7 @@ class QuantService:
         self.decisions.insert(0,audit); self.latest=result
         return result
 
-    def ensure(self):
+    def ensure(self, require_snapshot: bool = False):
         if self.latest is None:
             result=self.run_eod()
             if result.get("published") or result.get("displayable"):
@@ -273,13 +273,13 @@ class QuantService:
                 persisted=self.repository.list_decisions(1)
                 if persisted:
                     self.latest=persisted[0].get("snapshot")
-        if self.snapshot is None:
+        if require_snapshot and self.snapshot is None:
             as_of=date.fromisoformat(self.latest["as_of"][:10]) if self.latest else None
             self.snapshot=self._scoped_snapshot(self.provider.load(as_of))
         return self.latest
 
     def run_backtest(self, capital:float|None=None)->tuple[str,dict]:
-        self.ensure(); ident=str(uuid4()); result=result_dict(run_backtest(self.snapshot,capital or self.settings.capital)); result["id"]=ident; result["status"]="completed"
+        self.ensure(require_snapshot=True); ident=str(uuid4()); result=result_dict(run_backtest(self.snapshot,capital or self.settings.capital)); result["id"]=ident; result["status"]="completed"
         self.backtests[ident]=result; self.repository.save_backtest(ident,result); return ident,result
 
     def provider_statuses(self):

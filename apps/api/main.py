@@ -94,7 +94,7 @@ def candidates(): return {"items":service.ensure()["candidates"]}
 
 @app.get("/api/v1/stocks/{symbol}")
 def stock(symbol:str):
-    d=service.ensure(); all_items=d["portfolio"]+d["candidates"]
+    d=service.ensure(require_snapshot=True); all_items=d["portfolio"]+d["candidates"]
     item=next((x for x in all_items if x["symbol"].upper()==symbol.upper()),None)
     if not item: raise HTTPException(404,"股票不在当前精选或备选池")
     bars=[jsonable(b) for b in service.snapshot.bars if b.symbol.upper()==symbol.upper()]
@@ -133,7 +133,7 @@ def backtest(backtest_id:str):
 
 @app.post("/api/v1/research/runs",status_code=201)
 def create_research_run(req:ResearchRequest):
-    service.ensure()
+    service.ensure(require_snapshot=True)
     simulation=service.simulation().get("daily_equity",[])
     weeks=0.0
     if len(simulation)>1:

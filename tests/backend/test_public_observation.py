@@ -180,3 +180,19 @@ def test_empty_board_scope_fails_closed_without_entering_scoring(tmp_path):
     assert result.get("displayable") is not True
     assert result["quality"]["status"]=="blocked"
     assert {issue["code"] for issue in result["quality"]["issues"]}>={"NO_DATA"}
+
+
+def test_restart_serves_persisted_dashboard_without_reloading_public_provider(tmp_path):
+    database=tmp_path / "restart-cache.db"
+    first=QuantService(provider=PublicObservationFixture(),repository=SQLiteRepository(database))
+    expected=first.run_eod(date.today())
+
+    class MustNotReload(PublicObservationFixture):
+        def load(self, as_of=None):
+            raise AssertionError("persisted dashboard must not reload the public provider")
+
+    restarted=QuantService(provider=MustNotReload(),repository=SQLiteRepository(database))
+    actual=restarted.ensure()
+
+    assert actual["decision_id"]==expected["decision_id"]
+    assert restarted.snapshot is None

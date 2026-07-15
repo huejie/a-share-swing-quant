@@ -18,6 +18,9 @@ if ! grep -q '^QUANT_ADMIN_API_KEY=' .env; then
   fi
   printf '\nQUANT_ADMIN_API_KEY=%s\n' "$admin_key" >> .env
 fi
+if ! grep -q '^BACKUP_PATH=' .env; then
+  printf '%s\n' 'BACKUP_PATH=/var/backups/a-share-quant' >> .env
+fi
 if [ -z "$release_commit" ] && command -v git >/dev/null 2>&1 && [ -d .git ]; then
   release_commit="$(git rev-parse HEAD 2>/dev/null || true)"
 fi

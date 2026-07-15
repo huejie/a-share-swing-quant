@@ -293,7 +293,8 @@ class QuantService:
                       "demo" if self.provider.name==DeterministicDemoProvider.name else "production")
         provenance_keys=("public_data","observation_only","production_ready","pit_verified",
                          "pit_reconstruction","research_eligible","theme_mapping","enrichments",
-                         "security_metadata","price_history","data_quality","market_inputs")
+                         "security_metadata","price_history","data_quality","market_inputs",
+                         "universe_selection")
         data_provenance=jsonable({key:self.snapshot.metadata[key] for key in provenance_keys
                                   if key in self.snapshot.metadata})
         holding_symbols={item.symbol for item in portfolio}

@@ -23,7 +23,9 @@ def test_dashboard_pages_have_data_and_explanation():
     assert position["expected_holding_days"]==[40,80] and position["next_review_at"]
     assert client.get("/api/v1/market").status_code==200
     assert client.get("/api/v1/themes").json()["items"]
-    assert client.get("/api/v1/data/status").json()["providers"]
+    data_status=client.get("/api/v1/data/status").json()
+    assert data_status["providers"]
+    assert "provenance" in data_status
 
 
 def test_stock_detail_decision_audit_and_simulation():

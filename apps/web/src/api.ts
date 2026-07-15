@@ -51,6 +51,9 @@ function provenance(raw:Json,status:Json|undefined):DataProvenance{
  const pitVerified=detail.pit_verified===true;const productionReady=detail.production_ready===true;const degradations:string[]=[];
  if(typeof detail.warning==='string')degradations.push(detail.warning);if(typeof detail.reason==='string'&&detail.reason)degradations.push(detail.reason);
  for(const issue of raw.quality?.issues??[])if(typeof issue?.message==='string')degradations.push(issue.message);
+ const sourceAudit=raw.data_provenance??status?.provenance??{};const securityAudit=sourceAudit.security_metadata??{};const historyAudit=sourceAudit.price_history??{};
+ if(securityAudit.live_endpoint_available===false)degradations.push('实时个股元数据不可用，当前使用显式观察池静态元数据回退。');
+ const historySources=Object.values(historyAudit.sources??{}).map(String);if(historySources.includes('sina_qfq_fallback'))degradations.push('东方财富行情不可用，部分或全部标的已切换至新浪前复权日线。');
  if(!demo&&!pitVerified)degradations.push('未验证 PIT：历史可见时间、证券状态与题材成分不能视为已重建。');
  if(!demo&&!productionReady)degradations.push('非生产数据：不能作为可发布建议或策略验收依据。');
  return {provider,mode:demo?'demo':publicPrototype?'public-prototype':productionReady&&pitVerified?'verified':'research',pitVerified,productionReady,degradations:[...new Set(degradations)]};

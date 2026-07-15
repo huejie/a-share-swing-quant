@@ -110,7 +110,8 @@ def decision(decision_id:str):
 
 @app.get("/api/v1/data/status")
 def data_status():
-    d=service.ensure(); return {"quality":d["quality"],"providers":service.provider_statuses(),"active":d["provider"]}
+    d=service.ensure(); return {"quality":d["quality"],"providers":service.provider_statuses(),"active":d["provider"],
+                                "provenance":d.get("data_provenance",{})}
 
 @app.post("/api/v1/pipeline/eod")
 def pipeline(req:PipelineRequest,idempotency_key:str|None=Header(None,alias="Idempotency-Key"),x_idempotency_key:str|None=Header(None,alias="X-Idempotency-Key")):

@@ -211,10 +211,15 @@ class QuantService:
         if observation_mode: quality_view["status"]="observation_only"
         release_mode=("observation_only" if observation_mode else
                       "demo" if self.provider.name==DeterministicDemoProvider.name else "production")
+        provenance_keys=("public_data","observation_only","production_ready","pit_verified",
+                         "pit_reconstruction","research_eligible","theme_mapping","enrichments",
+                         "security_metadata","price_history","data_quality","market_inputs")
+        data_provenance=jsonable({key:self.snapshot.metadata[key] for key in provenance_keys
+                                  if key in self.snapshot.metadata})
         decision_id=str(uuid4()); result={"decision_id":decision_id,"run_key":run_key,
           "published":not observation_mode,"displayable":True,
           "production_published":release_mode=="production","release_mode":release_mode,
-          "as_of":self.snapshot.as_of.isoformat(),
+          "as_of":self.snapshot.as_of.isoformat(),"data_provenance":data_provenance,
           "provider":self.snapshot.provider,"quality":quality_view,"market":jsonable(market),"themes":jsonable(themes),
           "portfolio":jsonable(portfolio),"candidates":jsonable([x for x in stocks if x.eligible][:7]),
           "cash_weight":round(1-sum(x.target_weight for x in portfolio),4),"portfolio_status":portfolio_status,"portfolio_reason":portfolio_reason,"model_portfolio_only":True,

@@ -53,6 +53,8 @@ def test_complete_public_data_can_drive_forward_observation_but_not_production(t
     assert result["portfolio_condition"] in {"healthy", "partial", "risk_off"}
     assert result["quality"]["status"] == "observation_only"
     assert result["research_eligible"] is False
+    assert result["data_provenance"]["public_data"] is True
+    assert result["data_provenance"]["production_ready"] is False
     assert result["simulation"]["broker_connected"] is False
     assert result["simulation"]["matching_ready"] is False
     assert result["simulation"]["new_intents"] == []

@@ -12,7 +12,7 @@ function holdingFromAdvice(item:Json):Holding{
   weight:pct(item.target_weight),currentWeight:pct(item.current_weight),price:item.entry_price??0,change:0,
   thesis:item.thesis??[],invalidation:item.invalidation??'模型逻辑失效时退出',
   protectivePrice:item.protective_price??item.initial_stop??0,entry:trigger,
-  version:item.model_version??'swing-rules-0.2.0',timestamp:item.data_timestamp??'',
+  version:item.model_version??'swing-rules-0.2.1',timestamp:item.data_timestamp??'',
   risk:(item.risk_notes??[]).join('；')||'受市场波动与流动性约束',days:0,kind:'model'};
 }
 
@@ -28,7 +28,7 @@ function holdingFromCandidate(item:Json,asOf:string,version:string):Holding{
 const factorLabels:Record<string,string>={trend_breadth:'A股趋势与广度',style:'风格结构',liquidity:'成交与流动性',global_risk:'全球风险',sentiment:'情绪与拥挤',valuation:'估值与风险溢价'};
 function normalize(raw:Json,logs:Json[]):Snapshot{
  const asOf=raw.as_of??new Date().toISOString();
- const version=raw.portfolio?.[0]?.model_version??'swing-rules-0.2.0';
+ const version=raw.portfolio?.[0]?.model_version??'swing-rules-0.2.1';
  const held=new Set((raw.portfolio??[]).map((x:Json)=>x.symbol));
  const holdings=(raw.portfolio??[]).map(holdingFromAdvice);
  const candidates=(raw.candidates??[]).filter((x:Json)=>!held.has(x.symbol)).slice(0,3).map((x:Json)=>holdingFromCandidate(x,asOf,version));
@@ -36,7 +36,7 @@ function normalize(raw:Json,logs:Json[]):Snapshot{
   flow:t.turnover,crowding:t.crowding,note:`相对强度 ${t.relative_strength} · 龙头稳定 ${t.leadership}`}));
  const decisions:Decision[]=logs.map((d:Json)=>({id:d.id,date:(d.timestamp??'').replace('T',' ').slice(5,16),
   title:`${d.market_regime}：模型组合 ${d.holdings?.length??0} 只`,reason:(d.reasons??[]).join('；'),
-  version:d.model_version??'swing-rules-0.2.0',result:'已记录'}));
+  version:d.model_version??'swing-rules-0.2.1',result:'已记录'}));
  const components=raw.market?.components??{};
  return {asOf,portfolioStatus:raw.portfolio_status??'healthy',portfolioReason:raw.portfolio_reason,market:{state:raw.market?.regime??'未知',score:raw.market?.score??0,
    exposure:pct(raw.market?.exposure_cap),style:raw.market?.style??'待判断',

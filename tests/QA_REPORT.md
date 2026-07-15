@@ -25,7 +25,7 @@
 - Node / npm：20.19.3 / 10.8.2
 - `uv.lock` SHA-256：`0081A2A8E980C13E3F17FB05CA552CC67A5D7F2B1054720FFBE0F52796531A76`
 - `package-lock.json` SHA-256：`6FD8B53BDEFBC1FB7CAB7BF381F4A01DE77DFC03D2B5BF45D050A1725775768B`
-- 时区：Asia/Shanghai；Demo provider：`deterministic-demo`；模型：`swing-rules-0.2.0`
+- 时区：Asia/Shanghai；Demo provider：`deterministic-demo`；模型：`swing-rules-0.2.1`
 
 ## 需求—证据矩阵
 

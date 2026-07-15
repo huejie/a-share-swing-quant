@@ -31,7 +31,7 @@ Windows 若 Python 由 uv 管理，可使用仓库已验证的命令：
 
 ```powershell
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/pipeline/eod `
-  -Headers @{"Idempotency-Key"="eod-2026-07-03-swing-rules-0.2.0"} `
+  -Headers @{"Idempotency-Key"="eod-2026-07-03-swing-rules-0.2.1"} `
   -ContentType "application/json" -Body '{"as_of":"2026-07-03"}'
 ```
 

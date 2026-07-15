@@ -67,7 +67,8 @@ def ready():
     latest=service.ensure() or {}; freshness=latest.get("quality",{}).get("freshness","unknown")
     quality_status=latest.get("quality",{}).get("status","unknown")
     release_mode=latest.get("release_mode","demo" if service.provider.name=="deterministic-demo" else "production")
-    quality_usable=quality_status!="blocked" or release_mode=="observation_only"
+    quality_usable=(quality_status!="blocked" or release_mode=="observation_only" or
+                    service.provider.name=="deterministic-demo")
     ready_state=database and provider and quality_usable and (freshness=="fresh" or service.provider.name=="deterministic-demo")
     body={"status":"ready" if ready_state else "degraded","checks":{"database":database,"provider":active,"freshness":freshness,
           "quality_status":quality_status,"release_mode":release_mode,

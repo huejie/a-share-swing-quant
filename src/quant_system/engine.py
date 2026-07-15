@@ -8,7 +8,7 @@ from statistics import mean
 from .models import (Bar, DataSnapshot, ExitDecision, Lifecycle, MarketAssessment, MarketRegime,
                      PositionAdvice, StockAssessment, ThemeAssessment)
 
-MODEL_VERSION = "swing-rules-0.2.0"
+MODEL_VERSION = "swing-rules-0.2.1"
 ALL_FACTORS = frozenset({"market_regime","theme_score","stock_score","risk_control"})
 
 

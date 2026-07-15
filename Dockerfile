@@ -8,14 +8,18 @@ ARG PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
 
 WORKDIR /app
 
+COPY deploy/requirements-runtime.txt ./config/requirements-runtime.txt
+
+RUN python -m pip install --index-url "${PIP_INDEX_URL}" --upgrade pip \
+    && python -m pip install --index-url "${PIP_INDEX_URL}" -r ./config/requirements-runtime.txt
+
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY apps/__init__.py ./apps/__init__.py
 COPY apps/api ./apps/api
 COPY deploy/akshare-universe.csv ./config/akshare-universe.csv
 
-RUN python -m pip install --index-url "${PIP_INDEX_URL}" --upgrade pip \
-    && python -m pip install --index-url "${PIP_INDEX_URL}" ".[providers]"
+RUN python -m pip install --no-deps .
 
 RUN mkdir -p /app/data/research
 

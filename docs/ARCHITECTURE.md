@@ -11,11 +11,13 @@ Provider adapters -> Raw immutable store -> Point-in-time normalized store
                                              |
                     Features -> Regime -> Themes -> Stocks -> Portfolio/Risk
                                              |
-                    Backtest <-> Decision snapshots <-> Simulation
+              Shared holding policy <-> Backtest/Production
+                                             |
+             Compressed input snapshot <-> Decision audit <-> Simulation
                                              |
                                       FastAPI /api/v1
                                              |
-                                      React/Next Web
+                                      React/Vite Web
 ```
 
 ## 2. 模块边界
@@ -42,8 +44,9 @@ Provider adapters -> Raw immutable store -> Point-in-time normalized store
 1. **Raw**：供应商响应或标准化原始表，仅追加；主键含 `provider + dataset + instrument + observed_at + revision`。
 2. **Point-in-time normalized**：以 `effective_at/public_at` 控制可见性；所有历史查询必须带 `as_of`。
 3. **Features**：主键含 `trade_date + entity + feature_set_version + data_snapshot_id`。
-4. **Decision snapshot**：主键 `decision_id`，唯一 run key 为 `trade_date + account_profile + model_version + data_snapshot_id`。
-5. **Simulation ledger**：追加写事件，幂等键为 `simulation_id + decision_id + instrument + event_type`。
+4. **Input snapshot**：完整策略输入按稳定内容计算 SHA-256，以 zlib 压缩 JSON 保存；普通产品 API 只暴露可用性与大小，不返回原始授权数据。
+5. **Decision snapshot**：主键 `decision_id`；自动 run key 纳入交易日、provider、模型版本、完整策略配置 hash 与输入快照 hash，防止数据或配置改变时误命中幂等结果。
+6. **Simulation ledger**：追加写事件，幂等键为 `simulation_id + decision_id + instrument + event_type`。
 
 核心实体：`Instrument`、`ThemeMembership`、`MarketRegime`、`ThemeScore`、`StockCandidate`、`PortfolioRecommendation`、`PositionRecommendation`、`RiskRule`、`BacktestRun`、`SimulationAccount`、`DecisionSnapshot`、`QualityReport`。
 
@@ -115,7 +118,7 @@ sequenceDiagram
   "decision_id": "dec_...",
   "trade_date": "2026-07-06",
   "status": "healthy|partial|risk_off|stale|failed",
-  "model_version": "mvp-1.0.0",
+  "model_version": "swing-rules-0.4.0",
   "data_snapshot_id": "snap_...",
   "data_as_of": "2026-07-06T15:30:00+08:00",
   "account_capital_cny": "1000000.00",
@@ -165,7 +168,9 @@ sequenceDiagram
 
 ## 7. 回测与生产一致性
 
-`StrategyContext` 是唯一策略入口，至少包含 `as_of`、`data_snapshot_id`、`feature_set_version`、`model_version`、`account_profile`、`cost_model`。回测通过历史时钟逐日调用该入口；生产日终通过当前交易日调用。成交模拟在策略引擎外处理，确保策略不能看到未来成交。
+`StrategyContext` 是唯一策略入口，至少包含 `as_of`、`data_snapshot_id`、`feature_set_version`、`model_version`、`account_profile`、`cost_model`。回测通过历史时钟逐日调用该入口；生产日终通过当前交易日调用。持仓保留、周替换节流、风险退出和目标组合缓冲由共享的纯策略模块计算，生产服务与回测都调用同一实现；成交模拟仍在策略引擎外处理，确保策略不能看到未来成交。
+
+每次发布决策同时保存完整输入快照、质量结果、配置/模型版本、所有候选及过滤原因、核心题材和最终动作。`GET /api/v1/decisions/{decision_id}` 用于只读回放，并返回输入快照是否存在、内容哈希与压缩大小等审计元数据。
 
 随机过程必须固定 seed 并记录。参数搜索输出全部实验，不只保存最佳结果；最终样本外区间在冻结参数后才运行。
 

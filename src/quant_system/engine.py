@@ -8,7 +8,7 @@ from statistics import mean
 from .models import (Bar, DataSnapshot, ExitDecision, Lifecycle, MarketAssessment, MarketRegime,
                      PositionAdvice, StockAssessment, ThemeAssessment)
 
-MODEL_VERSION = "swing-rules-0.3.0"
+MODEL_VERSION = "swing-rules-0.4.0"
 ALL_FACTORS = frozenset({"market_regime","theme_score","stock_score","risk_control"})
 
 
@@ -158,9 +158,15 @@ def assess_themes(snapshot: DataSnapshot, active_factors: frozenset[str] | None=
 
 
 def assess_stocks(snapshot: DataSnapshot, themes: list[ThemeAssessment] | None=None, capital: float=1_000_000,
-                  active_factors: frozenset[str] | None=None) -> list[StockAssessment]:
+                  active_factors: frozenset[str] | None=None,
+                  selected_themes: set[str] | None=None,
+                  max_adv_participation: float=.02) -> list[StockAssessment]:
     histories=_history(snapshot); resolved_themes=themes or assess_themes(snapshot,active_factors)
     theme_scores={x.name:x.score for x in resolved_themes};theme_lifecycles={x.name:x.lifecycle for x in resolved_themes}
+    if selected_themes is None:
+        selected_themes={item.name for item in resolved_themes
+                         if item.lifecycle in {Lifecycle.STARTING,Lifecycle.EXPANDING,Lifecycle.HEALTHY}}
+        selected_themes=set(list(selected_themes)[:4])
     all_r60=mean(_return(x,60) for x in histories.values()); out=[]
     for symbol,bars in histories.items():
         last=bars[-1]; avg_amount=mean(x.amount for x in bars[-20:]); r60=_return(bars,60)
@@ -180,18 +186,29 @@ def assess_stocks(snapshot: DataSnapshot, themes: list[ThemeAssessment] | None=N
             "not_delisting": {"passed": not last.is_delisting, "reason": "无退市标记" if not last.is_delisting else "退市风险"},
             "regulatory": {"passed": not last.regulatory_risk, "reason": "无重大监管风险" if not last.regulatory_risk else "重大监管风险"},
             "audit": {"passed": not last.audit_abnormal, "reason": "无审计异常" if not last.audit_abnormal else "审计异常"},
-            "event_window": {"passed": not last.event_risk, "reason": "无重大事件窗口" if not last.event_risk else "重大事件窗口"},
+            "event_window": {
+                "passed": not last.event_risk,
+                "reason": ((f"无重大事件窗口；最近事件 {last.event_type}（{last.event_date}）"
+                            if last.event_type else "无重大事件窗口；未提供具体事件明细")
+                           if not last.event_risk else
+                           f"重大事件窗口：{last.event_type or '类型未提供'}（{last.event_date or '日期未提供'}）"),
+            },
             "tradeable": {"passed": not last.suspended, "reason": "可交易" if not last.suspended else "停牌"},
             "listing_age": {"passed": last.listed_days>=120, "reason": f"上市天数 {last.listed_days}"},
             "liquidity": {"passed": avg_amount>=50_000_000, "reason": f"20日均成交额 {avg_amount:.0f} 元"},
-            "capacity": {"passed": capital*.15<=avg_amount*.02, "reason": "15%最低目标仓位不超过20日均成交额2%"},
+            "capacity": {
+                "passed": capital*.15<=avg_amount*max_adv_participation,
+                "reason": f"15%最低目标仓位不超过20日均成交额{max_adv_participation*100:g}%",
+            },
             "theme_lifecycle": {"passed": allowed_lifecycle, "reason": f"题材阶段 {lifecycle.value}"},
+            "theme_selection": {"passed": last.theme in selected_themes,
+                                "reason": "进入本周核心题材" if last.theme in selected_themes else "未进入本周3—4个核心题材"},
         }
         # Lifecycle is an entry gate, not a security-universe hard failure:
         # an existing healthy holding may be observed through acceleration,
         # while a fading theme is handled by the explicit exit state machine.
         reason=next((gate["reason"] for name,gate in gates.items()
-                     if name!="theme_lifecycle" and not gate["passed"]),None)
+                     if name not in {"theme_lifecycle","theme_selection"} and not gate["passed"]),None)
         out.append(StockAssessment(symbol,last.name,last.theme,last.industry,round(score,1),last.close,round(atr,4),round(avg_amount,2),
                                    round(rs,1),round(trend,1),(f"题材强度 {theme_scores.get(last.theme,0):.1f}",f"60日相对强度 {rs:.1f}",f"中期趋势质量 {trend:.1f}"),
                                    reason is None,reason,lifecycle.value,gates))
@@ -254,11 +271,13 @@ def entry_signal(bars: list[Bar]) -> tuple[str, tuple[float,float]] | None:
 def evaluate_exit(*, entry:float, peak:float, close:float, initial_stop:float, holding_days:int,
                   hard_risk:bool=False, portfolio_drawdown:float=0, extreme_market:bool=False,
                   theme_fading:bool=False, trend_broken:bool=False, previous_protective:float|None=None,
-                  corporate_action_price_ratio:float=1.0, max_portfolio_drawdown:float=.18) -> ExitDecision:
+                  corporate_action_price_ratio:float=1.0, max_portfolio_drawdown:float=.18,
+                  excess_return:float|None=None) -> ExitDecision:
     protective=update_trailing_stop(previous_protective,entry,peak,corporate_action_price_ratio)
     checks=((1,hard_risk,"财务、退市、处罚等硬风险"),(2,portfolio_drawdown<=-abs(max_portfolio_drawdown),f"组合达到{abs(max_portfolio_drawdown)*100:.0f}%硬风控"),
             (3,extreme_market,"市场进入极端风险"),(4,theme_fading,"题材进入退潮"),(5,trend_broken,"个股趋势失效"),
             (6,close<=initial_stop,"触发ATR初始止损"),(6,protective is not None and close<=protective,"最高浮盈回吐30%"),
+            (7,holding_days>=40 and excess_return is not None and excess_return<=0,"持有满40个交易日仍无超额收益"),
             (7,holding_days>=80,"达到80个交易日时间退出"))
     for priority,trigger,reason in checks:
         if trigger:return ExitDecision(True,priority,reason,protective)
@@ -267,21 +286,25 @@ def evaluate_exit(*, entry:float, peak:float, close:float, initial_stop:float, h
 
 def build_portfolio(snapshot: DataSnapshot, market: MarketAssessment, stocks: list[StockAssessment], capital: float=1_000_000,
                     target_count: int=4, risk_per_trade: float=.0125, active_factors: frozenset[str] | None=None,
-                    allow_low_score_symbols: set[str] | None=None) -> list[PositionAdvice]:
+                    allow_low_score_symbols: set[str] | None=None,
+                    max_adv_participation: float=.02) -> list[PositionAdvice]:
     if market.exposure_cap<=0: return []
     max_count_by_exposure=int((market.exposure_cap+1e-9)/.15)
     desired_count=min(max(3,min(5,target_count)),max_count_by_exposure)
     if desired_count<3:return []
-    selected=[]; theme_count=defaultdict(int); industries=set(); histories=_history(snapshot);allow_low_score_symbols=allow_low_score_symbols or set()
+    selected=[]; theme_count=defaultdict(int); industry_count=defaultdict(int); histories=_history(snapshot);allow_low_score_symbols=allow_low_score_symbols or set()
     for stock in stocks:
-        if not stock.eligible or (stock.score<58 and stock.symbol not in allow_low_score_symbols) or theme_count[stock.theme]>=2: continue
+        if (not stock.eligible or (stock.score<58 and stock.symbol not in allow_low_score_symbols)
+                or theme_count[stock.theme]>=2 or industry_count[stock.industry]>=3):
+            continue
         lifecycle_gate=stock.gate_results.get("theme_lifecycle",{})
         if stock.symbol not in allow_low_score_symbols and not lifecycle_gate.get("passed",False):continue
+        if stock.symbol not in allow_low_score_symbols and not stock.gate_results.get("theme_selection",{}).get("passed",False):continue
         if stock.symbol not in allow_low_score_symbols and entry_signal(histories[stock.symbol]) is None:continue
-        # Duplicate industries are allowed up to the explicit two-name/theme
-        # limit; the aggregate industrial-chain cap is applied after sizing.
-        # This avoids an order-dependent first-pass skip that could miss a
-        # valid 3-name portfolio even when a later name supplies diversity.
+        # With a 15% single-name floor and a 45% industrial-chain cap, four
+        # names from one risk cluster can never form a feasible portfolio.
+        # Enforce that discrete feasibility here and continue scanning for a
+        # qualified substitute instead of shrinking positions below 15%.
         candidate_returns=_daily_returns(histories[stock.symbol],60)
         too_correlated=False
         for chosen in selected:
@@ -290,7 +313,7 @@ def build_portfolio(snapshot: DataSnapshot, market: MarketAssessment, stocks: li
             if correlation(candidate_returns,chosen_returns)>.95:
                 too_correlated=True;break
         if too_correlated:continue
-        selected.append(stock); theme_count[stock.theme]+=1; industries.add(stock.industry)
+        selected.append(stock); theme_count[stock.theme]+=1; industry_count[stock.industry]+=1
         if len(selected)>=desired_count: break
     if len(selected)<3: return []  # cash/no-trade is safer than forced concentration
     raw=[]
@@ -298,7 +321,8 @@ def build_portfolio(snapshot: DataSnapshot, market: MarketAssessment, stocks: li
         stop_distance=max(.07,min(.12,s.atr_pct*2.5))
         # Risk budget is applied to the 60% initial tranche.  The confirmed
         # target remains inside the documented 15%-25% band.
-        raw.append(min(.25,max(.15,risk_per_trade/(stop_distance*.60)),s.avg_amount_20d*.02/capital))
+        raw.append(min(.25,max(.15,risk_per_trade/(stop_distance*.60)),
+                       s.avg_amount_20d*max_adv_participation/capital))
     if len(selected)==3: cap=min(market.exposure_cap,.75)
     else: cap=market.exposure_cap
     if active_factors is not None and "risk_control" not in active_factors:
@@ -311,27 +335,42 @@ def build_portfolio(snapshot: DataSnapshot, market: MarketAssessment, stocks: li
             extra_total=sum(raw_extra)
             weights=[round(.15+(extra*(item/extra_total) if extra_total else 0.0),4) for item in raw_extra]
     # Industry is the MVP's conservative risk-cluster/industrial-chain proxy.
-    # A pair of correlated names may each pass the 25% single-name cap but must
-    # not exceed the documented 45% aggregate chain exposure.
+    # Allocate each member's mandatory 15% floor first, then distribute only
+    # the chain's remaining capacity.  Proportional scaling of the whole
+    # position would turn four 15% names into four 11.25% names and violate the
+    # single-name floor while merely making the aggregate appear compliant.
     by_industry=defaultdict(list)
     for idx,stock in enumerate(selected): by_industry[stock.industry].append(idx)
     for indices in by_industry.values():
         aggregate=sum(weights[i] for i in indices)
         if aggregate>.45:
-            factor=.45/aggregate
-            for i in indices: weights[i]=round(weights[i]*factor,4)
+            extra_capacity=max(0.0,.45-.15*len(indices))
+            requested_extras=[max(0.0,weights[i]-.15) for i in indices]
+            requested_total=sum(requested_extras)
+            allocated=0.0
+            for offset,(i,requested) in enumerate(zip(indices,requested_extras)):
+                if offset==len(indices)-1:
+                    extra=max(0.0,round(extra_capacity-allocated,4))
+                else:
+                    proportional=(extra_capacity*requested/requested_total if requested_total else 0.0)
+                    extra=int(proportional*10_000)/10_000
+                    allocated+=extra
+                weights[i]=round(.15+extra,4)
     advice=[]
     for s,w in zip(selected,weights):
         bars=histories[s.symbol]; entry=s.close; reference_factor=_factor(bars[-1])
+        latest_bar=bars[-1]
         peak=entry; stop=round(entry*(1-max(.07,min(.12,s.atr_pct*2.5))),2)
         signal=entry_signal(bars)
         # Retained holdings need no fresh entry signal; their original entry
         # state is restored by the service's position-state reconciliation.
         state,zone=signal if signal is not None else ("持仓复核",(entry,entry))
         next_review=snapshot.as_of+timedelta(days=(7-snapshot.as_of.weekday()) or 7)
+        event_note=(f"最近事件：{latest_bar.event_type}（{latest_bar.event_date}；来源 {latest_bar.event_source_ref}；解析 {latest_bar.event_parser_version}）"
+                    if latest_bar.event_type else "未提供可追溯的具体公告/事件明细")
         advice.append(PositionAdvice(s.symbol,s.name,s.theme,"待买",state,zone,w,round(w*.60,4),0.0,entry,stop,None,round(peak,2),s.score,
-                                     s.reasons,"收盘跌破初始止损、题材退潮或出现硬风险",("模型组合，不代表真实持仓","次日成交且受涨跌停/流动性约束"),(40,80),next_review,MODEL_VERSION,snapshot.as_of,
-                                     snapshot.as_of))
+                                     s.reasons,"收盘跌破初始止损、题材退潮或出现硬风险",(event_note,"模型组合，不代表真实持仓","次日成交且受涨跌停/流动性约束"),(40,80),next_review,MODEL_VERSION,snapshot.as_of,
+                                     snapshot.as_of,reference_adj_factor=reference_factor))
     return advice
 
 

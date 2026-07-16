@@ -38,6 +38,9 @@ if [ "${#admin_key}" -lt 32 ]; then
 fi
 
 docker compose build --pull
+# Existing named volumes were created by older root-running images.  Perform
+# one explicit ownership migration before starting the fixed non-root runtime.
+docker compose run --rm --no-deps --user 0 api sh -c 'chown -R 10001:10001 /app/data /app/backups'
 docker compose up -d --remove-orphans
 docker compose ps
 
@@ -56,7 +59,10 @@ if command -v systemctl >/dev/null 2>&1 && [ "$(id -u)" = "0" ]; then
   install -m 0644 deploy/systemd/a-share-quant-eod.timer /etc/systemd/system/a-share-quant-eod.timer
   install -m 0644 deploy/systemd/a-share-quant-backup.service /etc/systemd/system/a-share-quant-backup.service
   install -m 0644 deploy/systemd/a-share-quant-backup.timer /etc/systemd/system/a-share-quant-backup.timer
+  install -m 0644 deploy/systemd/a-share-quant-restore-verify.service /etc/systemd/system/a-share-quant-restore-verify.service
+  install -m 0644 deploy/systemd/a-share-quant-restore-verify.timer /etc/systemd/system/a-share-quant-restore-verify.timer
   systemctl daemon-reload
   systemctl enable --now a-share-quant-eod.timer
   systemctl enable --now a-share-quant-backup.timer
+  systemctl enable --now a-share-quant-restore-verify.timer
 fi

@@ -4,11 +4,38 @@
 
 ## 必需文件
 
-- `bars.csv`：至少包含 `symbol,date,open,high,low,close,volume,amount,industry,published_at,effective_at,available_at`。生产包建议同时提供 `is_st,is_delisting,regulatory_risk,audit_abnormal,event_risk,adj_factor,limit_up,limit_down,suspended,quality,catalyst`，用于硬风险过滤、公司行为和可成交约束。
+- `bars.csv`：必须包含 `symbol,date,open,high,low,close,volume,amount,industry,published_at,effective_at,collected_at,available_at,is_st,is_delisting,regulatory_risk,audit_abnormal,event_risk,adj_factor,limit_up,limit_down,suspended,listed_trading_days,free_float_market_cap,schema_version,source_ref`。交易状态、精确交易日龄、流通市值、来源和复权字段均不是可选项。
 - `securities.csv`：`symbol,name,listed_at,delisted_at,board`。退市记录必须保留。
 - `theme_memberships.csv`：`symbol,theme,effective_from,effective_to,published_at,available_at`。
 - `metadata.json`：授权、PIT 方法、批次及逐数据集新鲜度声明。
-- 可选 `pit_records.csv`：财务/公告等事件，字段为 `dataset,entity_id,effective_at,published_at,available_at,payload_json,revision,source_ref`。
+- `pit_records.csv`：必需，字段为 `dataset,entity_id,effective_at,published_at,collected_at,available_at,payload_json,revision,source_ref,parser_version`。所有字段均不可为空，`published_at ≤ collected_at ≤ available_at`，`payload_json` 必须是非空对象，`source_ref` 必须能追溯到原始来源。
+
+四个 CSV 都必须被 manifest 哈希覆盖。仅在 `metadata.datasets` 中自称存在，不构成数据证据。
+
+## 必需数据集与 PIT payload
+
+`metadata.datasets` 必须明确把以下八类数据声明为 `required: true`，并为每类提供可解析的 `as_of`：
+
+- `bars`：A股日行情及交易状态；
+- `security_master`：含退市历史的证券主数据；
+- `theme_memberships`：历史题材成分；
+- `corporate_actions`：公司行为与复权因子；
+- `financials`：财务质量与审计风险；
+- `announcements`：公告催化与硬风险；
+- `market_funding`：A股市场、融资及ETF资金/估值输入；
+- `global_risk`：全球市场风险输入。
+
+其中后五类必须在 `pit_records.csv` 中实际出现。证券级记录的 `entity_id` 使用股票代码，例如 `600000.SH`。最小 payload 契约如下：
+
+| dataset | 必需 payload 字段 |
+|---|---|
+| `corporate_actions` | `adj_factor`、`event_type`、`share_multiplier`（正数）、`cash_dividend_per_share`（非负数）；后两项为事件值，只在首个生效交易日物化到 Bar |
+| `financials` | `quality_score`（0–100）、`audit_abnormal`（布尔） |
+| `announcements` | `catalyst_score`（0–100）、`event_risk,regulatory_risk,is_delisting,is_st` 四类风险布尔值，以及 `event_type,event_date,raw_text_ref,parser_version` |
+| `market_funding` | `fund_flow_score,valuation_score`（0–100）及原始 `margin_balance,margin_balance_change,etf_share_change,market_breadth` |
+| `global_risk` | `global_risk_score`（0–100）及 `global_equity,usd_cny,interest_rate,volatility_index,commodity_index` 五个原始分项 |
+
+加载器会在每个 bar 的收盘时点选择当时已经发布且可用的最新记录：财务和公告分别物化为 `quality`、`catalyst` 与风险标记，公司行为物化为 `adj_factor`，市场与全球记录物化为 `market_inputs_history`。缺少对应证券/日期的记录、bar 与公司行为复权因子不一致，都会使生产门禁失败；不会回退到默认分数或伪造中性值。`listed_days` 按数据包中该证券已有交易日数量计算，不按自然日计算。
 
 最小 metadata 示例：
 
@@ -19,21 +46,23 @@
   "authorization": {
     "authorized": true,
     "scope": "internal-research-and-decision-support",
-    "reference": "由数据负责人填写的合同或授权引用"
+    "reference": "由数据负责人填写的合同或授权引用",
+    "valid_until": "2030-12-31",
+    "permitted_uses": ["research", "decision_support", "derived_output_display"]
   },
   "pit": {
     "verified": true,
     "method": "由数据负责人填写的发布时间与历史成分核验方法"
   },
   "datasets": {
-    "bars": {"as_of": "2026-07-06T18:00:00+08:00", "max_age_hours": 72, "required": true},
-    "theme_memberships": {"as_of": "2026-07-06T18:00:00+08:00", "max_age_hours": 168, "required": true}
-  },
-  "market_inputs": {
-    "global_risk_score": 50,
-    "fund_flow_score": 50,
-    "valuation_score": 50,
-    "source": "由数据负责人填写的跨市场、资金与估值快照引用"
+    "bars": {"as_of": "2026-07-06T18:00:00+08:00", "max_age_hours": 72, "required": true, "source_ref": "vendor-bars", "schema_version": "bars/v2"},
+    "security_master": {"as_of": "2026-07-06T18:00:00+08:00", "max_age_hours": 168, "required": true, "source_ref": "vendor-securities", "schema_version": "security/v2"},
+    "theme_memberships": {"as_of": "2026-07-06T18:00:00+08:00", "max_age_hours": 168, "required": true, "source_ref": "vendor-themes", "schema_version": "themes/v2"},
+    "corporate_actions": {"as_of": "2026-07-06T18:00:00+08:00", "max_age_hours": 168, "required": true, "source_ref": "vendor-actions", "schema_version": "actions/v2"},
+    "financials": {"as_of": "2026-07-06T18:00:00+08:00", "max_age_hours": 2880, "required": true, "source_ref": "vendor-financials", "schema_version": "financials/v2"},
+    "announcements": {"as_of": "2026-07-06T18:00:00+08:00", "max_age_hours": 72, "required": true, "source_ref": "vendor-announcements", "schema_version": "announcements/v2"},
+    "market_funding": {"as_of": "2026-07-06T18:00:00+08:00", "max_age_hours": 72, "required": true, "source_ref": "vendor-market", "schema_version": "market/v2"},
+    "global_risk": {"as_of": "2026-07-06T18:00:00+08:00", "max_age_hours": 72, "required": true, "source_ref": "vendor-global", "schema_version": "global/v2"}
   }
 }
 ```

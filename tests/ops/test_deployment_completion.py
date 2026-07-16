@@ -38,3 +38,22 @@ def test_daily_persistent_data_backup_is_deployed_not_only_documented():
     service = service_path.read_text(encoding="utf-8")
     assert "OnCalendar=" in timer and "Persistent=true" in timer
     assert "quant-data" in service or "/app/data" in service
+    assert "--artifact /app/data/research" in service
+
+
+def test_weekly_restore_verification_is_deployed():
+    timer=(ROOT/"deploy/systemd/a-share-quant-restore-verify.timer").read_text(encoding="utf-8")
+    service=(ROOT/"deploy/systemd/a-share-quant-restore-verify.service").read_text(encoding="utf-8")
+    deploy=(ROOT/"deploy/deploy.sh").read_text(encoding="utf-8")
+    assert "OnCalendar=Sun" in timer and "Persistent=true" in timer
+    assert "quant_system.backup_verify" in service
+    assert "enable --now a-share-quant-restore-verify.timer" in deploy
+
+
+def test_api_image_uses_locked_dependencies_and_non_root_runtime():
+    dockerfile=(ROOT/"Dockerfile").read_text(encoding="utf-8")
+    deploy=(ROOT/"deploy/deploy.sh").read_text(encoding="utf-8")
+    assert "COPY pyproject.toml uv.lock" in dockerfile
+    assert "uv export --frozen" in dockerfile and "--require-hashes" in dockerfile
+    assert "USER 10001:10001" in dockerfile
+    assert "chown -R 10001:10001 /app/data /app/backups" in deploy

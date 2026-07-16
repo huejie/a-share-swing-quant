@@ -5,6 +5,7 @@ from dataclasses import replace
 from quant_system.models import DataSnapshot
 from quant_system.providers import DeterministicDemoProvider
 from quant_system.quality import check_quality
+from quant_system.service import QuantService
 
 
 def test_stale_data_blocks_publication_quality_gate():
@@ -14,9 +15,47 @@ def test_stale_data_blocks_publication_quality_gate():
     assert any(i.code=="STALE" for i in q.issues)
 
 
+def test_persisted_decision_ages_to_stale_at_read_time_without_provider_reload():
+    latest={"as_of":"2026-07-01T18:00:00+08:00",
+            "quality":{"freshness":"fresh","status":"healthy","issues":[]}}
+    now=datetime(2026,7,5,18,tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    view=QuantService._runtime_freshness_view(latest,now)
+
+    assert latest["quality"]["freshness"]=="fresh"
+    assert view["quality"]["freshness"]=="stale"
+    assert view["quality"]["status"]=="blocked"
+    assert view["quality"]["age_hours"]==96.0
+    assert any(issue["code"]=="STALE" for issue in view["quality"]["issues"])
+
+
 def test_missing_data_is_blocked():
     now=datetime.now(ZoneInfo("Asia/Shanghai"));q=check_quality(DataSnapshot(now,[],"x",10),now)
     assert q.status=="blocked"
+
+
+def test_duplicate_future_and_trade_state_inconsistency_fail_closed():
+    now=datetime(2026,7,3,18,tzinfo=ZoneInfo("Asia/Shanghai"))
+    snapshot=DeterministicDemoProvider().load(date(2026,7,3))
+    last=snapshot.bars[-1]
+    snapshot.bars.extend([
+        last,
+        replace(last,day=date(2026,7,4)),
+        replace(last,symbol="HALT",suspended=True,volume=100,amount=1000),
+    ])
+    codes={issue.code for issue in check_quality(snapshot,now).issues}
+    assert {"DUPLICATE_BAR","FUTURE_BAR","TRADE_STATE_INCONSISTENT"}<=codes
+
+
+def test_declared_session_gap_and_extreme_adjustment_jump_fail_closed():
+    now=datetime(2026,7,3,18,tzinfo=ZoneInfo("Asia/Shanghai"))
+    snapshot=DeterministicDemoProvider().load(date(2026,7,3))
+    first=snapshot.bars[0]
+    snapshot.bars[0]=replace(first,adj_factor=100)
+    snapshot.metadata["expected_trading_days"]=["2026-06-28","2026-07-01","2026-07-02","2026-07-03"]
+    codes={issue.code for issue in check_quality(snapshot,now).issues}
+    assert "ADJ_FACTOR_JUMP" in codes
+    assert "MISSING_TRADING_SESSION" in codes
 
 
 def test_latest_session_coverage_uses_expected_universe_denominator():

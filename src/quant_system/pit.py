@@ -82,10 +82,14 @@ class PITRecord:
     payload: Mapping[str, Any]
     revision: int = 1
     source_ref: str = ""
+    collected_at: datetime | None = None
+    parser_version: str = ""
 
     def __post_init__(self):
         for name in ("effective_at", "published_at", "available_at"):
             object.__setattr__(self, name, parse_time(getattr(self, name)))
+        if self.collected_at is not None:
+            object.__setattr__(self, "collected_at", parse_time(self.collected_at))
         if self.revision < 1: raise ValueError("revision must be positive")
 
     @property

@@ -2,13 +2,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 import hashlib
+import json
 import os
 from threading import RLock
 from uuid import uuid4
 from .backtest import result_dict, run_backtest
-from .engine import (MODEL_VERSION, assess_market, assess_stocks, assess_themes, build_portfolio,
-                     entry_signal, evaluate_exit)
+from .engine import MODEL_VERSION, assess_market, assess_stocks, assess_themes, entry_signal
 from .models import DataSnapshot, jsonable
+from .notifications import NotificationDispatcher
+from .portfolio_policy import buffered_portfolio, weekly_theme_names
 from .providers import AkshareProvider, DeterministicDemoProvider, MarketDataProvider, TushareProvider
 from .quality import check_quality
 from .repository import SQLiteRepository
@@ -25,6 +27,7 @@ class Settings:
     include_bse: bool = False
     max_portfolio_drawdown: float = .18
     risk_per_trade: float = .0125
+    max_adv_participation: float = .02
     provider: str = "deterministic-demo"
     automatic_trading: bool = False
     notify_eod_success: bool = True
@@ -41,21 +44,33 @@ class QuantService:
     decisions: list[dict] = field(default_factory=list)
     backtests: dict[str,dict] = field(default_factory=dict)
     repository: SQLiteRepository = field(default_factory=lambda: SQLiteRepository(os.getenv("QUANT_DB_PATH","data/quant_system.db")))
+    settings_version: int = 0
     _eod_lock: RLock = field(default_factory=RLock,repr=False)
 
     def __post_init__(self):
         persisted = self.repository.load_settings()
         if persisted:
-            allowed = set(self.settings.__dataclass_fields__) - {"automatic_trading"}
+            self.settings_version=int(persisted.get("settings_version",0))
+            allowed = set(self.settings.__dataclass_fields__) - {"automatic_trading","provider"}
             for key, value in persisted.items():
                 if key in allowed:
                     setattr(self.settings, key, value)
         self.settings.automatic_trading = False
+        self.settings.provider=self.provider.name
         self.decisions=self.repository.list_decisions(100)
         self.backtests={x["id"]:x for x in self.repository.list_backtests() if "id" in x}
         if self.decisions:
-            self.latest=self.decisions[0].get("snapshot")
-            if not self.latest or "portfolio_status" not in self.latest or any(p.get("model_version")!=MODEL_VERSION for p in self.latest.get("portfolio",[])):
+            latest_decision=self.decisions[0]
+            self.latest=latest_decision.get("snapshot")
+            if (self.latest and latest_decision.get("model_version")==MODEL_VERSION and
+                    "model_version" not in self.latest):
+                # Backward-compatible read of snapshots written before the
+                # dashboard exposed its model version at the top level.
+                self.latest={**self.latest,"model_version":MODEL_VERSION}
+            if (not self.latest or "portfolio_status" not in self.latest or
+                    "selected_theme_names" not in self.latest or
+                    self.latest.get("model_version")!=MODEL_VERSION or
+                    any(p.get("model_version")!=MODEL_VERSION for p in self.latest.get("portfolio",[]))):
                 self.latest=None
 
     def update_settings(self, changes: dict, *, actor: str = "product-api") -> dict:
@@ -71,6 +86,7 @@ class QuantService:
         self.settings.automatic_trading = False
         payload = jsonable(self.settings)
         saved = self.repository.save_settings(payload, actor=actor)
+        self.settings_version=int(saved["settings_version"])
         self.latest = None
         return saved
 
@@ -86,6 +102,44 @@ class QuantService:
         day=as_of.date()+timedelta(days=1)
         while day.weekday()>=5:day+=timedelta(days=1)
         return datetime.combine(day,time(9,30),ZoneInfo("Asia/Shanghai"))
+
+    @staticmethod
+    def _runtime_freshness_view(latest: dict | None, now: datetime | None = None) -> dict | None:
+        """Age a persisted decision at read time without rewriting its audit record."""
+        if not latest or not latest.get("as_of"):
+            return latest
+        now=now or datetime.now(ZoneInfo("Asia/Shanghai"))
+        try:
+            as_of=datetime.fromisoformat(str(latest["as_of"]))
+        except (TypeError,ValueError):
+            return latest
+        if as_of.tzinfo is None:
+            as_of=as_of.replace(tzinfo=now.tzinfo)
+        age=max(0.0,(now-as_of.astimezone(now.tzinfo)).total_seconds()/3600)
+        quality=dict(latest.get("quality") or {})
+        if age<=72 or quality.get("freshness")=="stale":
+            return latest
+        issues=list(quality.get("issues") or [])
+        if not any(item.get("code")=="STALE" for item in issues if isinstance(item,dict)):
+            issues.append({"code":"STALE","severity":"error",
+                           "message":f"数据距今 {age:.1f} 小时，禁止作为当前建议"})
+        quality.update({"freshness":"stale","status":"blocked","age_hours":round(age,1),"issues":issues})
+        return {**latest,"quality":quality}
+
+    @staticmethod
+    def _snapshot_hash(snapshot: DataSnapshot) -> str:
+        volatile={"collected_at","collection_time","generated_at","retrieved_at","fetched_at"}
+        def stable(value):
+            if isinstance(value,dict):
+                return {key:stable(item) for key,item in sorted(value.items()) if key not in volatile}
+            if isinstance(value,list):return [stable(item) for item in value]
+            return value
+        bars=sorted((jsonable(bar) for bar in snapshot.bars),key=lambda item:(item["symbol"],item["day"]))
+        payload={"provider":snapshot.provider,"as_of":snapshot.as_of.isoformat(),
+                 "expected_symbols":snapshot.expected_symbols,"bars":bars,
+                 "metadata":stable(jsonable(snapshot.metadata))}
+        encoded=json.dumps(payload,ensure_ascii=False,separators=(",",":"),sort_keys=True)
+        return hashlib.sha256(encoded.encode()).hexdigest()
 
     def _scoped_snapshot(self, snapshot: DataSnapshot) -> DataSnapshot:
         def allowed(board: str) -> bool:
@@ -110,116 +164,142 @@ class QuantService:
         return DataSnapshot(snapshot.as_of,bars,snapshot.provider,expected,metadata)
 
     def _buffered_portfolio(self, snapshot, market, stocks, portfolio_drawdown: float = 0.0):
-        """Apply a one-normal-replacement-per-ISO-week buffer using current assessments only."""
+        previous = self.decisions[0] if self.decisions else None
+        return buffered_portfolio(
+            snapshot, market, stocks, previous_decision=previous,
+            capital=self.settings.capital, target_count=self.settings.target_count,
+            risk_per_trade=self.settings.risk_per_trade,
+            max_adv_participation=self.settings.max_adv_participation,
+            max_drawdown=self.settings.max_portfolio_drawdown,
+            portfolio_drawdown=portfolio_drawdown,
+        )
+
+    def _exit_actions(self, snapshot:DataSnapshot, stocks:list, turnover:dict)->list[dict]:
+        previous=self.decisions[0].get("snapshot",{}) if self.decisions else {}
+        prior_by={item.get("symbol"):item for item in previous.get("portfolio",[]) if item.get("symbol")}
+        stock_by={item.symbol:item for item in stocks}
+        latest_by={}
+        for bar in snapshot.bars:
+            if bar.day==snapshot.as_of.date() or bar.symbol not in latest_by or bar.day>latest_by[bar.symbol].day:
+                latest_by[bar.symbol]=bar
+        actions=[]
+        for replacement in turnover.get("replaced",[]):
+            symbol=replacement.get("symbol");prior=prior_by.get(symbol,{})
+            stock=stock_by.get(symbol);bar=latest_by.get(symbol)
+            if not symbol:continue
+            actions.append({
+                "symbol":symbol,"name":prior.get("name") or getattr(stock,"name",None) or (bar.name if bar else symbol),
+                "theme":prior.get("theme") or getattr(stock,"theme",None) or (bar.theme if bar else "未分类"),
+                "action":"退出","target_weight":0.0,
+                "initial_weight":0.0,"current_weight":prior.get("target_weight",prior.get("current_weight",0.0)),
+                "entry_price":prior.get("entry_price",bar.close if bar else 0.0),
+                "initial_stop":prior.get("initial_stop",0.0),"protective_price":prior.get("protective_price"),
+                "highest_price":prior.get("highest_price",bar.high if bar else 0.0),
+                "entry_state":"退出触发","trigger_zone":[],"score":getattr(stock,"score",prior.get("score",0.0)),
+                "thesis":[replacement.get("reason") or "退出条件触发"],
+                "invalidation":replacement.get("reason") or "退出条件触发",
+                "risk_notes":["模型退出动作；次日可成交且受停牌、跌停和流动性约束"],
+                "expected_holding_days":[40,80],"next_review_at":snapshot.as_of.isoformat(),
+                "model_version":MODEL_VERSION,"data_timestamp":snapshot.as_of.isoformat(),
+                "exit_priority":replacement.get("priority"),"exit_reason":replacement.get("reason"),
+                "exit_kind":replacement.get("kind"),
+            })
+        return actions
+
+    def _weekly_theme_names(self,snapshot:DataSnapshot,themes:list)->list[str]:
         previous=self.decisions[0] if self.decisions else None
-        previous_snapshot=previous.get("snapshot",{}) if previous else {}
-        old_symbols=[p["symbol"] for p in previous_snapshot.get("portfolio",[])]
-        # A model version/config discontinuity starts a fresh lineage rather than mixing rules.
-        if previous and previous.get("model_version")!=MODEL_VERSION:
-            old_symbols=[];previous=None
-        current_week=snapshot.as_of.date().isocalendar()[:2]
-        previous_week=None
-        if previous:
-            previous_week=datetime.fromisoformat(previous["data_timestamp"]).date().isocalendar()[:2]
-        prior_turnover=previous.get("turnover",{}) if previous else {}
-        week_used=int(prior_turnover.get("week_normal_replacements_used",0)) if previous_week==current_week else 0
-        replacement_budget=max(0,1-week_used)
-        by_symbol={s.symbol:s for s in stocks};eligible=[s for s in stocks if s.eligible]
-        histories={}
-        for bar in snapshot.bars:histories.setdefault(bar.symbol,[]).append(bar)
-        for values in histories.values():values.sort(key=lambda item:item.day)
-        previous_positions={item["symbol"]:item for item in previous_snapshot.get("portfolio",[])}
-        position_states={};risk_exits=[]
-        rank={s.symbol:(i+1)/max(1,len(eligible)) for i,s in enumerate(eligible)}
-        hard=[];normal_candidates=[];retained=[]
-        for symbol in old_symbols:
-            stock=by_symbol.get(symbol)
-            prior=previous_positions.get(symbol,{})
-            symbol_bars=histories.get(symbol,[])
-            if stock is None or not symbol_bars:
-                hard.append({"symbol":symbol,"reason":"当前证券池或行情缺失","kind":"hard_risk"})
-                continue
-            if not stock.eligible:
-                hard.append({"symbol":symbol,"reason":stock.excluded_reason or "当前证券硬风险门禁失败","kind":"hard_risk"})
-                continue
-            latest=symbol_bars[-1]
-            entry=float(prior.get("entry_price") or latest.close)
-            peak=max(float(prior.get("highest_price") or entry),latest.high)
-            initial_stop=float(prior.get("initial_stop") or entry*.90)
-            raw_entry_at=prior.get("entry_at") or prior.get("data_timestamp") or snapshot.as_of.isoformat()
-            try:entry_at=datetime.fromisoformat(str(raw_entry_at))
-            except ValueError:entry_at=snapshot.as_of
-            holding_days=sum(1 for bar in symbol_bars if bar.day>=entry_at.date())
-            exit_decision=evaluate_exit(
-                entry=entry,peak=peak,close=latest.close,initial_stop=initial_stop,
-                holding_days=holding_days,hard_risk=not stock.eligible,
-                portfolio_drawdown=portfolio_drawdown,
-                extreme_market=market.exposure_cap<=0,
-                theme_fading=stock.theme_lifecycle=="退潮",
-                trend_broken=stock.trend<35,
-                previous_protective=prior.get("protective_price"),
-                max_portfolio_drawdown=self.settings.max_portfolio_drawdown,
+        return weekly_theme_names(snapshot,themes,previous)
+
+    def _notify(self, *, run_key: str, event_type: str, payload: dict) -> dict | None:
+        """Best-effort notification boundary; never alters an EOD outcome."""
+        try:
+            return NotificationDispatcher(self.repository).emit(
+                event_key=f"{run_key}:{event_type}",
+                event_type=event_type,
+                channel=self.settings.notification_channel,
+                payload={"run_key": run_key, "model_version": MODEL_VERSION,
+                         "provider": self.provider.name, **payload},
             )
-            position_states[symbol]={"entry_price":entry,"highest_price":peak,
-                "initial_stop":initial_stop,"protective_price":exit_decision.protective_price,
-                "entry_at":entry_at,"holding_days":holding_days,
-                "entry_state":prior.get("entry_state","持仓复核")}
-            if exit_decision.should_exit:
-                risk_exits.append({"symbol":symbol,"reason":exit_decision.reason,
-                                   "kind":"risk_exit","priority":exit_decision.priority})
-            elif rank.get(symbol,1)>.30:
-                normal_candidates.append({"symbol":symbol,"reason":f"当前排名 {rank[symbol]*100:.1f}%，跌出前30%","kind":"normal"})
+        except Exception:
+            # Persistence and delivery are deliberately secondary to the
+            # immutable decision/run result. The dispatcher stores safe
+            # failures whenever the repository remains available.
+            return None
+
+    @staticmethod
+    def _terminal_simulation_symbols(snapshot: DataSnapshot, latest_day: date | None,
+                                     held: dict[str,dict]) -> dict[str,str]:
+        """Return only positions with affirmative permanent-unpriceable evidence."""
+        if latest_day is None:return {}
+        histories:dict[str,list]= {}
+        for bar in snapshot.bars:
+            histories.setdefault(bar.symbol,[]).append(bar)
+        explicit=set(snapshot.metadata.get("delisted_symbols",[]) if isinstance(snapshot.metadata,dict) else [])
+        result={}
+        for symbol in held:
+            history=sorted(histories.get(symbol,[]),key=lambda bar:bar.day)
+            if symbol in explicit:
+                result[symbol]="provider_confirmed_delisted"
+            elif history and history[-1].day<latest_day and history[-1].is_delisting:
+                result[symbol]="delisting_flag_then_permanent_quote_absence"
+            elif (history and history[-1].day<latest_day-timedelta(days=20)
+                  and not history[-1].suspended):
+                result[symbol]="quote_absent_over_20_calendar_days_without_suspension"
+            elif history and history[-1].suspended and history[-1].day<latest_day-timedelta(days=60):
+                result[symbol]="suspension_quote_stale_over_60_calendar_days"
+        return result
+
+    @staticmethod
+    def _simulation_execution_plan(portfolio:list,exit_actions:list[dict],latest_bars:dict,
+                                   held:dict[str,dict],equity:float)->tuple[list[dict],list[dict],dict]:
+        """Translate model targets into deltas against the actual paper account."""
+        intents=[];payloads=[];desired_symbols=set()
+        for advice in portfolio:
+            item=jsonable(advice);symbol=item["symbol"];desired_symbols.add(symbol)
+            position=held.get(symbol,{});shares=int(position.get("shares",0));bar=latest_bars.get(symbol)
+            price=float(bar.close) if bar is not None else 0.0
+            current_value=shares*price;current_weight=current_value/equity if equity>0 else 0.0
+            target=float(item["target_weight"])
+            execution_target=float(item["initial_weight"] if shares<=0 else target)
+            delta=execution_target*equity-current_value
+            lot_value=price*100
+            if shares<=0:
+                action="待买";stage="initial"
+            elif delta>=lot_value>0:
+                action="加仓";stage="add_confirmation"
+            elif delta<=-lot_value<0:
+                action="减仓";stage="target_reduction"
             else:
-                retained.append(symbol)
-        if portfolio_drawdown <= -abs(self.settings.max_portfolio_drawdown):
-            replaced=[{"symbol":symbol,
-                       "reason":f"组合达到{abs(self.settings.max_portfolio_drawdown)*100:.0f}%硬风控",
-                       "kind":"risk_exit","priority":2} for symbol in old_symbols]
-            turnover={"replacement_budget":replacement_budget,"week_normal_replacements_used":week_used,
-                      "retained":[],"replaced":replaced,"added":[],"exception":"portfolio_drawdown_risk_off"}
-            return [],turnover
-        normal_replaced=normal_candidates[:replacement_budget]
-        retained.extend(x["symbol"] for x in normal_candidates[replacement_budget:])
-        if market.exposure_cap<=0:
-            replaced=[{"symbol":s,"reason":"市场 risk_off/极端风险","kind":"market_risk"} for s in old_symbols]
-            turnover={"replacement_budget":replacement_budget,"week_normal_replacements_used":week_used,
-                      "retained":[],"replaced":replaced,"added":[],"exception":"risk_off"}
-            return [],turnover
-        replaced=hard+risk_exits+normal_replaced
-        initialization=len(old_symbols)==0
-        recovery=len(old_symbols)<3 or (len(retained)<3 and bool(hard))
-        if initialization:desired=max(3,min(5,self.settings.target_count))
-        elif recovery:desired=3
-        else:desired=max(3,len(old_symbols)-len(hard))
-        # One normal removal permits at most one normal addition. Hard-risk recovery may fill to three.
-        add_slots=max(0,desired-len(retained))
-        exited_symbols={item["symbol"] for item in hard+risk_exits}
-        ordered=[by_symbol[s] for s in retained if s in by_symbol]
-        ordered.extend(s for s in stocks if s.symbol not in set(retained) and s.symbol not in exited_symbols)
-        portfolio=build_portfolio(snapshot,market,ordered,self.settings.capital,desired,self.settings.risk_per_trade,allow_low_score_symbols=set(retained))
-        final_symbols=[p.symbol for p in portfolio]
-        final_retained=[s for s in retained if s in final_symbols]
-        added=[s for s in final_symbols if s not in old_symbols]
-        # If constraints unexpectedly evict a buffered holding, do not silently exceed the weekly budget.
-        constraint_evictions=[s for s in retained if s not in final_symbols]
-        if constraint_evictions and not recovery:
-            allowed=set(x["symbol"] for x in normal_replaced)
-            if any(s not in allowed for s in constraint_evictions):
-                # Fail closed to the prior valid holdings by rebuilding from retained current assessments only.
-                portfolio=build_portfolio(snapshot,market,[by_symbol[s] for s in retained if s in by_symbol],self.settings.capital,max(3,len(retained)),self.settings.risk_per_trade,allow_low_score_symbols=set(retained))
-                final_symbols=[p.symbol for p in portfolio];final_retained=[s for s in retained if s in final_symbols];added=[]
-        for p in portfolio:
-            if p.symbol in final_retained:
-                state=position_states[p.symbol];p.action="持有";p.entry_state=state["entry_state"]
-                p.entry_price=state["entry_price"];p.highest_price=round(state["highest_price"],2)
-                p.initial_stop=state["initial_stop"];p.protective_price=state["protective_price"]
-                p.entry_at=state["entry_at"]
-        used_now=len(normal_replaced)
-        exception="initialization" if initialization else "recovery_to_three" if recovery else None
-        turnover={"replacement_budget":replacement_budget,"week_normal_replacements_used":week_used+used_now,
-                  "retained":[{"symbol":s,"reason":"仍在当前合格前30%，使用持仓缓冲"} for s in final_retained],
-                  "replaced":replaced,"added":[{"symbol":s,"reason":"当前重新评分后入选"} for s in added],"exception":exception}
-        return portfolio,turnover
+                action="持有";stage="hold"
+            item.update({"action":action,"current_weight":round(current_weight,4),
+                         "model_target_weight":target,"execution_target_weight":round(execution_target,4),
+                         "execution_stage":stage,"simulated_shares":shares})
+            payloads.append(item)
+            common={"symbol":symbol,"target_weight":target,"initial_weight":float(item["initial_weight"]),
+                    "current_weight":round(current_weight,6),"execution_target_weight":execution_target,
+                    "model_action":action,"stage":stage}
+            if price<=0:continue
+            if delta>=lot_value:
+                intents.append({**common,"side":"buy","amount":round(delta,2)})
+            elif delta<=-lot_value:
+                quantity=int((-delta/price)//100)*100
+                if quantity>0:intents.append({**common,"side":"sell","quantity":min(shares,quantity)})
+        for symbol,position in held.items():
+            if symbol in desired_symbols:continue
+            shares=int(position["shares"]);bar=latest_bars.get(symbol);price=float(bar.close) if bar else 0.0
+            weight=shares*price/equity if equity>0 else 0.0
+            intents.append({"symbol":symbol,"side":"sell","quantity":shares,"target_weight":0.0,
+                            "initial_weight":0.0,"current_weight":round(weight,6),
+                            "execution_target_weight":0.0,"model_action":"退出","stage":"exit"})
+        by_exit={item.get("symbol"):item for item in exit_actions}
+        for symbol,item in by_exit.items():
+            position=held.get(symbol,{});bar=latest_bars.get(symbol);shares=int(position.get("shares",0))
+            current=shares*(float(bar.close) if bar else 0.0)/equity if equity>0 else 0.0
+            item.update({"current_weight":round(current,4),"simulated_shares":shares,
+                         "model_action":"退出","execution_target_weight":0.0})
+        state={"account_equity":round(equity,2),"actual_position_count":len(held),
+               "intent_count":len(intents),"basis":"actual_simulated_shares_vs_model_execution_target"}
+        return payloads,intents,state
 
     def run_eod(self, as_of: date | None=None, *, enforce_freshness=False, run_key: str|None=None) -> dict:
         with self._eod_lock:
@@ -227,15 +307,35 @@ class QuantService:
 
     def _run_eod(self, as_of: date | None=None, *, enforce_freshness=False, run_key: str|None=None) -> dict:
         requested=(as_of or (date(2026,7,3) if self.provider.name==DeterministicDemoProvider.name else date.today()))
-        config=f"{self.settings.capital}:{self.settings.target_count}:{self.settings.risk_per_trade}:{self.settings.include_main}:{self.settings.include_chinext}:{self.settings.include_star}:{self.settings.include_bse}"
-        run_key=run_key or hashlib.sha256(f"{self.provider.name}:{requested}:{MODEL_VERSION}:{config}".encode()).hexdigest()[:24]
-        previous=self.repository.get_run(run_key)
-        if previous is not None:
-            if previous.get("published") or previous.get("displayable"):
-                self.latest=previous
-            previous={**previous,"idempotent_replay":True}
-            return previous
+        config_payload={key:getattr(self.settings,key) for key in (
+            "capital","target_count","max_portfolio_drawdown","risk_per_trade","max_adv_participation",
+            "include_main","include_chinext","include_star","include_bse")}
+        config_payload["settings_version"]=self.settings_version
+        config_encoded=json.dumps(config_payload,ensure_ascii=False,separators=(",",":"),sort_keys=True)
+        config_hash=hashlib.sha256(config_encoded.encode()).hexdigest()
+        if run_key is not None:
+            previous=self.repository.get_run(run_key)
+            if previous is not None:
+                previous={**previous,"model_version":previous.get("model_version",MODEL_VERSION)}
+                if previous.get("published") or previous.get("displayable"):
+                    self.latest=previous
+                return {**previous,"idempotent_replay":True}
         raw_snapshot=self.provider.load(requested)
+        data_snapshot_hash=self._snapshot_hash(raw_snapshot)
+        simulation_lineage={"model_version":MODEL_VERSION,"provider":raw_snapshot.provider,
+                            "config_hash":config_hash,"settings_version":self.settings_version,
+                            "data_snapshot_hash":data_snapshot_hash}
+        self.repository.save_input_snapshot(data_snapshot_hash,jsonable(raw_snapshot))
+        if run_key is None:
+            run_key=hashlib.sha256(
+                f"{self.provider.name}:{requested}:{MODEL_VERSION}:{config_hash}:{data_snapshot_hash}".encode()
+            ).hexdigest()[:24]
+            previous=self.repository.get_run(run_key)
+            if previous is not None:
+                previous={**previous,"model_version":previous.get("model_version",MODEL_VERSION)}
+                if previous.get("published") or previous.get("displayable"):
+                    self.latest=previous
+                return {**previous,"idempotent_replay":True}
         self.snapshot=self._scoped_snapshot(raw_snapshot)
         self.repository.ensure_simulation_account(self.settings.capital)
         raw_latest_day=max(b.day for b in raw_snapshot.bars) if raw_snapshot.bars else None
@@ -261,25 +361,74 @@ class QuantService:
                       (effective_gate or not error_codes.issubset(demo_relaxable_errors)))
         matched=[]
         if should_block:
-            valuation=self.repository.mark_to_market(self.snapshot.as_of.date().isoformat(),{s:b.close for s,b in ledger_bars.items()},{"run_key":run_key,"quality":"blocked","matched":matched})
-            blocked={"published":False,"run_key":run_key,"quality":jsonable(q),"message":"数据质量门禁未通过，保留上一版建议并标记过期","last_published":self.latest,"simulation":{"matched":matched,"valuation":valuation}}
+            valuation=self.repository.mark_to_market(self.snapshot.as_of.date().isoformat(),{s:b.close for s,b in ledger_bars.items()},
+                {"run_key":run_key,"quality":"blocked","matched":matched,
+                 **simulation_lineage,"matching_ready":False})
+            blocked={"published":False,"run_key":run_key,"model_version":MODEL_VERSION,
+                     "config_version":self.settings_version,"config_hash":config_hash,
+                     "data_snapshot_hash":data_snapshot_hash,"quality":jsonable(q),
+                     "message":"数据质量门禁未通过，保留上一版建议并标记过期",
+                     "last_published":self.latest,"simulation":{"matched":matched,"valuation":valuation}}
             self.repository.save_run(run_key,"blocked",blocked)
+            if self.settings.notify_risk:
+                self._notify(
+                    run_key=run_key,
+                    event_type="quality_blocked",
+                    payload={
+                        "as_of": self.snapshot.as_of.isoformat(),
+                        "quality_status": q.status,
+                        "quality_issue_codes": sorted(error_codes),
+                        "message": "数据质量门禁未通过，日终决策未发布",
+                    },
+                )
             return blocked
         matching_ready=(not observation_requested or
                         bool(self.snapshot.metadata.get("simulation_matching_ready",False)))
         # Matching happens only after the quality gate. Existing positions and
         # pending exits still use full-market bars so a board-scope change
         # cannot value an excluded holding at zero.
+        corporate_actions=[];risk_disposals=[]
         if matching_ready:
+            last_mark=self.repository.simulation_last_trade_date()
+            event_bars=[bar for bar in raw_snapshot.bars
+                        if (abs(float(bar.share_multiplier or 1.0)-1.0)>1e-12 or
+                            abs(float(bar.cash_dividend_per_share or 0.0))>1e-12)
+                        and (last_mark is None or bar.day>date.fromisoformat(last_mark))]
+            corporate_actions=self.repository.apply_corporate_actions(run_key,event_bars)
+            held_before_match=self.repository.simulation_positions()
+            terminal=self._terminal_simulation_symbols(raw_snapshot,raw_latest_day,held_before_match)
+            risk_disposals=self.repository.write_down_terminal_positions(run_key,terminal)
             matched=self.repository.match_pending(raw_snapshot.as_of.isoformat(),ledger_bars)
         valuation=self.repository.mark_to_market(
             self.snapshot.as_of.date().isoformat(),
             {s:b.close for s,b in ledger_bars.items()},
-            {"run_key":run_key,"matched":matched,"broker_connected":False},
+            {"run_key":run_key,"matched":matched,"corporate_actions":corporate_actions,
+             "risk_disposals":risk_disposals,"broker_connected":False,"quality":q.status,
+             **simulation_lineage,"matching_ready":matching_ready},
         )
-        market=assess_market(self.snapshot); themes=assess_themes(self.snapshot); stocks=assess_stocks(self.snapshot,themes,self.settings.capital)
+        market=assess_market(self.snapshot); themes=assess_themes(self.snapshot)
+        selected_theme_names=self._weekly_theme_names(self.snapshot,themes)
+        stocks=assess_stocks(
+            self.snapshot,themes,self.settings.capital,
+            selected_themes=set(selected_theme_names),
+            max_adv_participation=self.settings.max_adv_participation,
+        )
         portfolio,turnover=self._buffered_portfolio(self.snapshot,market,stocks,valuation["drawdown"])
-        portfolio_condition="risk_off" if market.exposure_cap<=0 else ("partial" if len(portfolio)<3 else "healthy")
+        exit_actions=self._exit_actions(self.snapshot,stocks,turnover)
+        held=self.repository.simulation_positions()
+        portfolio_payload,intents,execution_state=self._simulation_execution_plan(
+            portfolio,exit_actions,latest_bars,held,valuation["equity"])
+        if not matching_ready:
+            execution_state={**execution_state,"suppressed_intent_count":len(intents),
+                             "suppressed_reason":"source_not_simulation_matching_ready"}
+            intents=[]
+        portfolio_risk_off=(market.exposure_cap<=0 or
+                            turnover.get("exception")=="portfolio_drawdown_risk_off")
+        actionable_risk=portfolio_risk_off or any(
+            action.get("exit_priority") is not None and int(action["exit_priority"])<=6
+            for action in exit_actions
+        )
+        portfolio_condition="risk_off" if portfolio_risk_off else ("partial" if len(portfolio)<3 else "healthy")
         portfolio_status=("observation" if observation_mode and portfolio_condition=="healthy"
                           else portfolio_condition)
         portfolio_reason=("市场处于极端风险状态，保持现金" if portfolio_condition=="risk_off" else
@@ -298,20 +447,30 @@ class QuantService:
         data_provenance=jsonable({key:self.snapshot.metadata[key] for key in provenance_keys
                                   if key in self.snapshot.metadata})
         holding_symbols={item.symbol for item in portfolio}
-        backups=[item for item in stocks if item.eligible and item.symbol not in holding_symbols][:3]
+        backups=[item for item in stocks if item.eligible and item.symbol not in holding_symbols and
+                 item.gate_results.get("theme_selection",{}).get("passed")][:3]
         history_by_symbol={}
         for bar in self.snapshot.bars:history_by_symbol.setdefault(bar.symbol,[]).append(bar)
         signal_qualified=sum(1 for item in stocks if item.eligible and
                              entry_signal(sorted(history_by_symbol[item.symbol],key=lambda bar:bar.day)) is not None)
         selection_funnel={"universe":len(stocks),"security_eligible":sum(1 for item in stocks if item.eligible),
-                          "theme_entry_qualified":sum(1 for item in stocks if item.eligible and item.gate_results.get("theme_lifecycle",{}).get("passed")),
+                          "theme_entry_qualified":sum(1 for item in stocks if item.eligible and item.gate_results.get("theme_lifecycle",{}).get("passed") and item.gate_results.get("theme_selection",{}).get("passed")),
                           "signal_qualified":signal_qualified,"selected":len(portfolio),"backups":len(backups)}
+        strategy_config={**config_payload,"model_version":MODEL_VERSION,"config_hash":config_hash}
         decision_id=str(uuid4()); result={"decision_id":decision_id,"run_key":run_key,
           "published":not observation_mode,"displayable":True,
           "production_published":release_mode=="production","release_mode":release_mode,
+          "model_version":MODEL_VERSION,
+          "config_version":self.settings_version,"config_hash":config_hash,
+          "data_snapshot_hash":data_snapshot_hash,
+          "strategy_config":strategy_config,
           "as_of":self.snapshot.as_of.isoformat(),"data_provenance":data_provenance,
           "provider":self.snapshot.provider,"quality":quality_view,"market":jsonable(market),"themes":jsonable(themes),
-          "portfolio":jsonable(portfolio),"candidates":jsonable(backups),"selection_funnel":selection_funnel,
+          "selected_theme_names":selected_theme_names,
+          "selected_themes":[jsonable(theme) for theme in themes if theme.name in selected_theme_names],
+          "portfolio":portfolio_payload,"exit_actions":exit_actions,
+          "candidates":jsonable(backups),"selection_funnel":selection_funnel,
+          "candidate_audit":jsonable(stocks),
           "cash_weight":round(1-sum(x.target_weight for x in portfolio),4),"portfolio_status":portfolio_status,"portfolio_reason":portfolio_reason,"model_portfolio_only":True,
           "portfolio_condition":portfolio_condition,
           "research_eligible":False if observation_mode else bool(self.snapshot.metadata.get("research_eligible",False)),
@@ -319,31 +478,60 @@ class QuantService:
           "disclaimer":"仅供研究与决策辅助，不构成收益承诺；系统不连接券商、不自动交易。"}
         audit={"id":decision_id,"timestamp":datetime.now().astimezone().isoformat(),"data_timestamp":self.snapshot.as_of.isoformat(),
                "model_version":MODEL_VERSION,"provider":self.snapshot.provider,"market_regime":market.regime,
+               "config_version":self.settings_version,"config_hash":config_hash,
+               "data_snapshot_hash":data_snapshot_hash,
+               "input_snapshot":self.repository.input_snapshot_status(data_snapshot_hash),
                "release_mode":release_mode,"production_published":result["production_published"],
                "research_eligible":result["research_eligible"],
-               "holdings":[x.symbol for x in portfolio],"reasons":list(market.reasons),"snapshot":result}
+               "holdings":[x["symbol"] for x in portfolio_payload],"reasons":list(market.reasons),"snapshot":result}
         audit["turnover"]=turnover
         audit=jsonable(audit);self.repository.save_decision(audit,run_key)
         effective=self._next_trading_time(
             self.snapshot.as_of,
             self.snapshot.metadata.get("next_trading_day") if isinstance(self.snapshot.metadata,dict) else None,
         ).isoformat()
-        held=self.repository.simulation_positions();desired={p["symbol"]:p for p in result["portfolio"]};intents=[]
         if matching_ready:
-            for symbol,position in held.items():
-                if symbol not in desired:
-                    intents.append({"symbol":symbol,"side":"sell","quantity":position["shares"],"target_weight":0,"initial_weight":0})
-            for symbol,p in desired.items():
-                current_value=held.get(symbol,{}).get("shares",0)*latest_bars[symbol].close
-                amount=max(0,p["initial_weight"]*valuation["equity"]-current_value)
-                if amount>=latest_bars[symbol].close*100:
-                    intents.append({"symbol":symbol,"side":"buy","amount":round(amount,2),"target_weight":p["target_weight"],"initial_weight":p["initial_weight"]})
-            self.repository.append_simulation_intents(run_key,self.snapshot.as_of.isoformat(),effective,intents)
+            self.repository.replace_simulation_intents(run_key,self.snapshot.as_of.isoformat(),effective,intents)
         result["simulation"]={"matched":matched,"valuation":valuation,"new_intents":intents,
+                              "execution_state":execution_state,"corporate_actions":corporate_actions,
+                              "risk_disposals":risk_disposals,
                               "matching_ready":matching_ready,
                               "matching_reason":None if matching_ready else "公开源缺少完整涨跌停/停牌约束，仅展示决策观察，不生成或撮合模拟指令",
                               "broker_connected":False}
         self.repository.save_run(run_key,"observation" if observation_mode else "published",result)
+        if self.settings.notify_eod_success:
+            self._notify(
+                run_key=run_key,
+                event_type="eod_success",
+                payload={
+                    "decision_id": decision_id,
+                    "as_of": self.snapshot.as_of.isoformat(),
+                    "release_mode": release_mode,
+                    "quality_status": quality_view.get("status"),
+                    "portfolio_status": portfolio_status,
+                    "portfolio_condition": portfolio_condition,
+                    "market_regime": market.regime,
+                    "market_exposure_cap": market.exposure_cap,
+                    "message": "日终决策流水线执行成功",
+                },
+            )
+        if self.settings.notify_risk and actionable_risk:
+            self._notify(
+                run_key=run_key,
+                event_type="risk_alert",
+                payload={
+                    "decision_id": decision_id,
+                    "as_of": self.snapshot.as_of.isoformat(),
+                    "release_mode": release_mode,
+                    "quality_status": quality_view.get("status"),
+                    "portfolio_status": portfolio_status,
+                    "portfolio_condition": portfolio_condition,
+                    "market_regime": market.regime,
+                    "market_exposure_cap": market.exposure_cap,
+                    "message": ("组合级风险门禁触发，模型组合保持现金" if portfolio_risk_off else
+                                "个股硬风险、趋势或止损退出条件已触发"),
+                },
+            )
         self.decisions.insert(0,audit); self.latest=result
         return result
 
@@ -365,12 +553,16 @@ class QuantService:
         if require_snapshot and self.snapshot is None:
             as_of=date.fromisoformat(self.latest["as_of"][:10]) if self.latest else None
             self.snapshot=self._scoped_snapshot(self.provider.load(as_of))
+        self.latest=self._runtime_freshness_view(self.latest)
         return self.latest
 
     def run_backtest(self, capital:float|None=None)->tuple[str,dict]:
         self.ensure(require_snapshot=True); ident=str(uuid4()); result=result_dict(run_backtest(
             self.snapshot,capital or self.settings.capital,
-            max_portfolio_drawdown=self.settings.max_portfolio_drawdown)); result["id"]=ident; result["status"]="completed"
+            max_portfolio_drawdown=self.settings.max_portfolio_drawdown,
+            target_count=self.settings.target_count,
+            risk_per_trade=self.settings.risk_per_trade,
+            max_adv_participation=self.settings.max_adv_participation)); result["id"]=ident; result["status"]="completed"
         self.backtests[ident]=result; self.repository.save_backtest(ident,result); return ident,result
 
     def provider_statuses(self):

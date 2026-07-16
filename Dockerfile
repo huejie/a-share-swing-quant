@@ -5,23 +5,31 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 
 ARG PIP_INDEX_URL=https://mirrors.cloud.tencent.com/pypi/simple
+ARG UV_VERSION=0.11.29
 
 WORKDIR /app
 
-COPY deploy/requirements-runtime.txt ./config/requirements-runtime.txt
+COPY pyproject.toml uv.lock ./
 
 RUN python -m pip install --index-url "${PIP_INDEX_URL}" --upgrade pip \
-    && python -m pip install --index-url "${PIP_INDEX_URL}" -r ./config/requirements-runtime.txt
+    && python -m pip install --index-url "${PIP_INDEX_URL}" "uv==${UV_VERSION}" \
+    && uv export --frozen --no-dev --extra providers --no-emit-project --output-file /tmp/requirements.lock \
+    && uv pip install --system --index-url "${PIP_INDEX_URL}" --require-hashes -r /tmp/requirements.lock \
+    && rm -f /tmp/requirements.lock \
+    && groupadd --gid 10001 quant \
+    && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin quant
 
-COPY pyproject.toml README.md ./
-COPY src ./src
-COPY apps/__init__.py ./apps/__init__.py
-COPY apps/api ./apps/api
-COPY deploy/akshare-universe.csv ./config/akshare-universe.csv
+COPY --chown=10001:10001 src ./src
+COPY --chown=10001:10001 apps/__init__.py ./apps/__init__.py
+COPY --chown=10001:10001 apps/api ./apps/api
+COPY --chown=10001:10001 deploy/akshare-universe.csv ./config/akshare-universe.csv
 
-RUN python -m pip install --no-deps .
+ENV PYTHONPATH=/app/src:/app
 
-RUN mkdir -p /app/data/research
+RUN mkdir -p /app/data/research /app/backups \
+    && chown -R 10001:10001 /app/data /app/backups
+
+USER 10001:10001
 
 EXPOSE 8000
 

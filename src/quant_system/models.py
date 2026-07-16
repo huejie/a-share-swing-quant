@@ -50,6 +50,13 @@ class Bar:
     audit_abnormal: bool = False
     event_risk: bool = False
     adj_factor: float = 1.0
+    free_float_market_cap: float = 0.0
+    share_multiplier: float = 1.0
+    cash_dividend_per_share: float = 0.0
+    event_type: str = ""
+    event_date: str = ""
+    event_source_ref: str = ""
+    event_parser_version: str = ""
 
 
 @dataclass
@@ -152,6 +159,7 @@ class PositionAdvice:
     entry_at: datetime | None = None
     exit_priority: int | None = None
     exit_reason: str | None = None
+    reference_adj_factor: float = 1.0
 
 
 @dataclass(frozen=True)

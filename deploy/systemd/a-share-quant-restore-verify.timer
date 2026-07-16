@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekly isolated restore verification for A-share quant backups
+
+[Timer]
+OnCalendar=Sun *-*-* 03:15:00 Asia/Shanghai
+Persistent=true
+Unit=a-share-quant-restore-verify.service
+
+[Install]
+WantedBy=timers.target

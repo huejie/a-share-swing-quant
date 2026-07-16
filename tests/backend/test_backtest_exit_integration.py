@@ -32,7 +32,7 @@ def test_profit_giveback_exit_is_executed_next_session(monkeypatch):
         1,
     )
 
-    monkeypatch.setattr(backtest_module, "assess_market", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(backtest_module, "assess_market", lambda *_args, **_kwargs: SimpleNamespace(exposure_cap=.90))
     monkeypatch.setattr(backtest_module, "assess_themes", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(backtest_module, "assess_stocks", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(

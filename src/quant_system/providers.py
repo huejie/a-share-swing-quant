@@ -6,6 +6,7 @@ import math
 import os
 import time as clock_time
 from abc import ABC, abstractmethod
+from dataclasses import asdict, replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from statistics import mean, median
@@ -15,6 +16,18 @@ from .models import Bar, DataSnapshot
 from .pit import PITRecord, PointInTimeStore, RawBatchManifest, SecurityHistory, ThemeMembership, parse_time
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def _with_trading_day_age(bars:list[Bar],minimum:int=120)->list[Bar]:
+    """Use observed sessions, retaining a conservative floor for older listings."""
+    first_by_symbol={}
+    for bar in sorted(bars,key=lambda item:item.day):first_by_symbol.setdefault(bar.symbol,bar)
+    floors={symbol:(minimum-1 if bar.listed_days>=minimum else 0) for symbol,bar in first_by_symbol.items()}
+    counts:dict[str,int]={};result=[]
+    for bar in sorted(bars,key=lambda item:(item.day,item.symbol)):
+        counts[bar.symbol]=counts.get(bar.symbol,0)+1
+        result.append(replace(bar,listed_days=floors[bar.symbol]+counts[bar.symbol]))
+    return sorted(result,key=lambda item:(item.symbol,item.day))
 
 
 class MarketDataProvider(ABC):
@@ -110,12 +123,51 @@ class CsvProvider(MarketDataProvider):
 class LicensedCsvBundleProvider(MarketDataProvider):
     """Read a local licensed/PIT bundle whose claims are explicit and hash-verifiable.
 
-    Required files are metadata.json, bars.csv, securities.csv and
-    theme_memberships.csv.  metadata.json must carry ``authorization.authorized``
-    and ``pit.verified``; neither is inferred from the directory name.
+    Every production input is both hash-covered and point-in-time reconstructable.
+    Authorization and PIT verification are explicit claims; content validation
+    independently proves that the claimed datasets and fields are actually present.
     """
     name = "licensed-csv-bundle"
-    required_files = ("bars.csv", "securities.csv", "theme_memberships.csv")
+    required_authorization_uses = frozenset({"research", "decision_support", "derived_output_display"})
+    required_files = ("bars.csv", "securities.csv", "theme_memberships.csv", "pit_records.csv")
+    required_datasets = (
+        "bars", "security_master", "theme_memberships", "corporate_actions",
+        "financials", "announcements", "market_funding", "global_risk",
+    )
+    required_pit_datasets = (
+        "corporate_actions", "financials", "announcements", "market_funding", "global_risk",
+    )
+    required_bar_fields = (
+        "symbol", "date", "open", "high", "low", "close", "volume", "amount", "industry",
+        "published_at", "effective_at", "available_at", "is_st", "is_delisting",
+        "regulatory_risk", "audit_abnormal", "event_risk", "adj_factor",
+        "limit_up", "limit_down", "suspended", "listed_trading_days",
+        "free_float_market_cap", "collected_at", "schema_version", "source_ref",
+    )
+    required_pit_fields = (
+        "dataset", "entity_id", "effective_at", "published_at", "available_at",
+        "collected_at", "payload_json", "revision", "source_ref", "parser_version",
+    )
+    required_security_fields = ("symbol", "name", "listed_at", "delisted_at", "board")
+    required_theme_fields = (
+        "symbol", "theme", "effective_from", "effective_to", "published_at", "available_at",
+    )
+    required_payload_fields = {
+        "corporate_actions": ("adj_factor", "event_type", "share_multiplier", "cash_dividend_per_share"),
+        "financials": ("quality_score", "audit_abnormal"),
+        "announcements": (
+            "catalyst_score", "event_risk", "regulatory_risk", "is_delisting", "is_st",
+            "event_type", "event_date", "raw_text_ref", "parser_version",
+        ),
+        "market_funding": (
+            "fund_flow_score", "valuation_score", "margin_balance", "margin_balance_change",
+            "etf_share_change", "market_breadth",
+        ),
+        "global_risk": (
+            "global_risk_score", "global_equity", "usd_cny", "interest_rate",
+            "volatility_index", "commodity_index",
+        ),
+    }
 
     def __init__(self, root: str | Path):
         self.root = Path(root)
@@ -134,22 +186,289 @@ class LicensedCsvBundleProvider(MarketDataProvider):
         signed_metadata = {k: v for k, v in self.metadata.items() if k != "manifest"}
         return manifest.verify(self.root, signed_metadata)
 
+    @staticmethod
+    def _fieldnames(path: Path) -> set[str]:
+        with path.open(encoding="utf-8-sig", newline="") as handle:
+            return set(csv.DictReader(handle).fieldnames or ())
+
+    def _contract_errors(self) -> tuple[str, ...]:
+        errors: list[str] = []
+        bar_symbols: set[str] = set()
+        security_symbols: set[str] = set()
+        theme_symbols: set[str] = set()
+        pit_entities: dict[str, set[str]] = {}
+        manifest = self._manifest()
+        covered = set(manifest.files) if manifest else set()
+        for name in self.required_files:
+            if (self.root / name).is_file() and name not in covered:
+                errors.append(f"manifest_not_covering:{name}")
+
+        datasets = self.metadata.get("datasets")
+        if not isinstance(datasets, dict):
+            errors.append("datasets_missing_or_invalid")
+        else:
+            for name in self.required_datasets:
+                details = datasets.get(name)
+                if not isinstance(details, dict):
+                    errors.append(f"dataset_missing:{name}")
+                elif details.get("required") is not True or not details.get("as_of") or details.get("available") is False:
+                    errors.append(f"dataset_not_explicitly_required_available:{name}")
+                else:
+                    try:
+                        parse_time(details["as_of"])
+                    except (TypeError, ValueError):
+                        errors.append(f"dataset_asof_invalid:{name}")
+                    if not str(details.get("source_ref") or "").strip():
+                        errors.append(f"dataset_source_ref_missing:{name}")
+                    if not str(details.get("schema_version") or "").strip():
+                        errors.append(f"dataset_schema_version_missing:{name}")
+
+        bars_path = self.root / "bars.csv"
+        if bars_path.is_file():
+            missing = sorted(set(self.required_bar_fields) - self._fieldnames(bars_path))
+            errors.extend(f"bars_field_missing:{name}" for name in missing)
+            with bars_path.open(encoding="utf-8-sig", newline="") as handle:
+                bar_rows = list(csv.DictReader(handle))
+            if not bar_rows:
+                errors.append("csv_empty:bars.csv")
+            boolean_fields = (
+                "is_st", "is_delisting", "regulatory_risk", "audit_abnormal", "event_risk",
+                "limit_up", "limit_down", "suspended",
+            )
+            boolean_values = {"true", "false", "1", "0", "yes", "no"}
+            for line_number, row in enumerate(bar_rows, start=2):
+                for field_name in self.required_bar_fields:
+                    if not str(row.get(field_name) or "").strip():
+                        errors.append(f"bars_value_missing:{field_name}:line={line_number}")
+                for field_name in boolean_fields:
+                    if str(row.get(field_name) or "").strip().lower() not in boolean_values:
+                        errors.append(f"bars_boolean_invalid:{field_name}:line={line_number}")
+                for field_name in ("date", "effective_at", "published_at", "collected_at", "available_at"):
+                    try:
+                        date.fromisoformat(row[field_name]) if field_name == "date" else parse_time(row[field_name])
+                    except (KeyError, TypeError, ValueError):
+                        errors.append(f"bars_time_invalid:{field_name}:line={line_number}")
+                try:
+                    published=parse_time(row["published_at"]);collected=parse_time(row["collected_at"])
+                    available=parse_time(row["available_at"])
+                    if collected<published:errors.append(f"bars_collected_before_published:line={line_number}")
+                    if available<collected:errors.append(f"bars_available_before_collected:line={line_number}")
+                except (KeyError,TypeError,ValueError):
+                    pass
+                try:
+                    adj_factor = float(row.get("adj_factor") or 0)
+                    if not math.isfinite(adj_factor) or adj_factor <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    errors.append(f"bars_adj_factor_invalid:line={line_number}")
+                try:
+                    listed_days = int(row.get("listed_trading_days") or 0)
+                    if listed_days < 1:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    errors.append(f"bars_listed_trading_days_invalid:line={line_number}")
+                try:
+                    free_float = float(row.get("free_float_market_cap") or 0)
+                    if not math.isfinite(free_float) or free_float <= 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    errors.append(f"bars_free_float_market_cap_invalid:line={line_number}")
+            bar_symbols = {str(row.get("symbol") or "").strip() for row in bar_rows if row.get("symbol")}
+        securities_path = self.root / "securities.csv"
+        if securities_path.is_file():
+            missing = sorted(set(self.required_security_fields) - self._fieldnames(securities_path))
+            errors.extend(f"securities_field_missing:{name}" for name in missing)
+            with securities_path.open(encoding="utf-8-sig", newline="") as handle:
+                security_rows = list(csv.DictReader(handle))
+            if not security_rows:
+                errors.append("csv_empty:securities.csv")
+            security_symbols = {str(row.get("symbol") or "").strip() for row in security_rows if row.get("symbol")}
+        themes_path = self.root / "theme_memberships.csv"
+        if themes_path.is_file():
+            missing = sorted(set(self.required_theme_fields) - self._fieldnames(themes_path))
+            errors.extend(f"theme_field_missing:{name}" for name in missing)
+            with themes_path.open(encoding="utf-8-sig", newline="") as handle:
+                theme_rows = list(csv.DictReader(handle))
+            if not theme_rows:
+                errors.append("csv_empty:theme_memberships.csv")
+            theme_symbols = {str(row.get("symbol") or "").strip() for row in theme_rows if row.get("symbol")}
+        pit_path = self.root / "pit_records.csv"
+        present_pit_datasets: set[str] = set()
+        if pit_path.is_file():
+            missing = sorted(set(self.required_pit_fields) - self._fieldnames(pit_path))
+            errors.extend(f"pit_field_missing:{name}" for name in missing)
+            if not missing:
+                with pit_path.open(encoding="utf-8-sig", newline="") as handle:
+                    for line_number, row in enumerate(csv.DictReader(handle), start=2):
+                        dataset = str(row.get("dataset") or "").strip()
+                        entity_id = str(row.get("entity_id") or "").strip()
+                        source_ref = str(row.get("source_ref") or "").strip()
+                        if dataset:
+                            present_pit_datasets.add(dataset)
+                            if entity_id:
+                                pit_entities.setdefault(dataset, set()).add(entity_id)
+                        if not entity_id:
+                            errors.append(f"pit_entity_missing:line={line_number}")
+                        if not source_ref:
+                            errors.append(f"pit_source_ref_missing:line={line_number}")
+                        if not str(row.get("parser_version") or "").strip():
+                            errors.append(f"pit_parser_version_missing:line={line_number}")
+                        parsed_times = {}
+                        for field_name in ("effective_at", "published_at", "collected_at", "available_at"):
+                            try:
+                                parsed_times[field_name] = parse_time(row.get(field_name) or "")
+                            except (TypeError, ValueError):
+                                errors.append(f"pit_timestamp_invalid:{field_name}:line={line_number}")
+                        if {"published_at", "collected_at", "available_at"} <= parsed_times.keys():
+                            if parsed_times["collected_at"] < parsed_times["published_at"]:
+                                errors.append(f"pit_collected_before_published:line={line_number}")
+                            if parsed_times["available_at"] < parsed_times["collected_at"]:
+                                errors.append(f"pit_available_before_collected:line={line_number}")
+                        try:
+                            revision = int(row.get("revision") or 0)
+                            if revision < 1:
+                                raise ValueError
+                        except (TypeError, ValueError):
+                            errors.append(f"pit_revision_invalid:line={line_number}")
+                        try:
+                            payload = json.loads(row.get("payload_json") or "")
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            payload = None
+                        if not isinstance(payload, dict) or not payload:
+                            errors.append(f"pit_payload_invalid:line={line_number}")
+                            continue
+                        for field_name in self.required_payload_fields.get(dataset, ()):
+                            if field_name not in payload:
+                                errors.append(f"pit_payload_field_missing:{dataset}:{field_name}:line={line_number}")
+                        for field_name in ("quality_score", "catalyst_score", "fund_flow_score", "valuation_score", "global_risk_score"):
+                            if field_name in payload:
+                                try:
+                                    value = float(payload[field_name])
+                                    if not math.isfinite(value) or not 0 <= value <= 100:
+                                        raise ValueError
+                                except (TypeError, ValueError):
+                                    errors.append(f"pit_score_invalid:{dataset}:{field_name}:line={line_number}")
+                        if "adj_factor" in payload:
+                            try:
+                                value = float(payload["adj_factor"])
+                                if not math.isfinite(value) or value <= 0:
+                                    raise ValueError
+                            except (TypeError, ValueError):
+                                errors.append(f"pit_adj_factor_invalid:line={line_number}")
+                        for field_name in ("share_multiplier",):
+                            if field_name in payload:
+                                try:
+                                    value = float(payload[field_name])
+                                    if not math.isfinite(value) or value <= 0:
+                                        raise ValueError
+                                except (TypeError, ValueError):
+                                    errors.append(f"pit_positive_number_invalid:{dataset}:{field_name}:line={line_number}")
+                        for field_name in (
+                            "cash_dividend_per_share", "margin_balance", "margin_balance_change",
+                            "etf_share_change", "market_breadth", "global_equity", "usd_cny",
+                            "interest_rate", "volatility_index", "commodity_index",
+                        ):
+                            if field_name in payload:
+                                try:
+                                    value = float(payload[field_name])
+                                    if not math.isfinite(value):
+                                        raise ValueError
+                                    if field_name in {"cash_dividend_per_share", "margin_balance", "usd_cny",
+                                                      "interest_rate", "volatility_index", "commodity_index"} and value < 0:
+                                        raise ValueError
+                                except (TypeError, ValueError):
+                                    errors.append(f"pit_number_invalid:{dataset}:{field_name}:line={line_number}")
+                        for field_name in ("event_type", "event_date", "raw_text_ref", "parser_version"):
+                            if field_name in payload and not str(payload[field_name] or "").strip():
+                                errors.append(f"pit_text_invalid:{dataset}:{field_name}:line={line_number}")
+                        for field_name in ("audit_abnormal", "event_risk", "regulatory_risk", "is_delisting", "is_st"):
+                            if field_name in payload and not isinstance(payload[field_name], bool):
+                                errors.append(f"pit_boolean_invalid:{dataset}:{field_name}:line={line_number}")
+        for name in self.required_pit_datasets:
+            if name not in present_pit_datasets:
+                errors.append(f"pit_dataset_missing:{name}")
+        for symbol in sorted(bar_symbols):
+            if symbol not in security_symbols:
+                errors.append(f"bar_security_missing:{symbol}")
+            if symbol not in theme_symbols:
+                errors.append(f"bar_theme_history_missing:{symbol}")
+            for dataset in ("corporate_actions", "financials", "announcements"):
+                if symbol not in pit_entities.get(dataset, set()):
+                    errors.append(f"bar_pit_entity_missing:{dataset}:{symbol}")
+        if not errors and bar_symbols:
+            try:
+                store = self._load_pit()
+                record_index = self._record_index(store)
+                theme_index = self._theme_index(store)
+                for line_number, row in enumerate(bar_rows, start=2):
+                    bar_day = date.fromisoformat(row["date"])
+                    day_cutoff = datetime.combine(bar_day, time(23, 59, 59), SHANGHAI)
+                    if max(parse_time(row["effective_at"]), parse_time(row["published_at"]),
+                           parse_time(row["collected_at"]), parse_time(row["available_at"])) > day_cutoff:
+                        errors.append(f"bar_not_visible_on_effective_day:line={line_number}")
+                    if self._latest_theme(theme_index, row["symbol"], day_cutoff) is None:
+                        errors.append(f"bar_theme_not_visible:{row['symbol']}:{bar_day.isoformat()}")
+                    for dataset in ("corporate_actions", "financials", "announcements"):
+                        if self._latest_record(record_index, dataset, day_cutoff, row["symbol"]) is None:
+                            errors.append(f"bar_pit_not_visible:{dataset}:{row['symbol']}:{bar_day.isoformat()}")
+                    action = self._latest_record(record_index, "corporate_actions", day_cutoff, row["symbol"])
+                    if action is not None and not math.isclose(
+                        float(row["adj_factor"]), float(action.payload["adj_factor"]), rel_tol=1e-9, abs_tol=1e-9,
+                    ):
+                        errors.append(f"bar_adj_factor_not_reconciled:{row['symbol']}:{bar_day.isoformat()}")
+                for bar_day in sorted({date.fromisoformat(row["date"]) for row in bar_rows}):
+                    day_cutoff = datetime.combine(bar_day, time(23, 59, 59), SHANGHAI)
+                    for dataset in ("market_funding", "global_risk"):
+                        if self._latest_record(record_index, dataset, day_cutoff) is None:
+                            errors.append(f"market_pit_not_visible:{dataset}:{bar_day.isoformat()}")
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                errors.append(f"pit_materialization_validation_error:{type(exc).__name__}")
+        return tuple(sorted(set(errors)))
+
     def status(self) -> dict:
         files_present = all((self.root / name).is_file() for name in self.required_files)
         manifest_valid, errors = self._manifest_status()
+        contract_errors = self._contract_errors()
+        contract_valid = not contract_errors
         authorization = self.metadata.get("authorization", {})
         pit = self.metadata.get("pit", {})
-        authorized = authorization.get("authorized") is True and bool(authorization.get("scope"))
+        declared_uses = authorization.get("permitted_uses", [])
+        uses = {str(item).strip() for item in declared_uses} if isinstance(declared_uses, list) else set()
+        authorization_errors = []
+        if authorization.get("authorized") is not True:
+            authorization_errors.append("authorization_not_confirmed")
+        if not str(authorization.get("scope") or "").strip():
+            authorization_errors.append("authorization_scope_missing")
+        if not str(authorization.get("reference") or "").strip():
+            authorization_errors.append("authorization_reference_missing")
+        if not self.required_authorization_uses <= uses:
+            authorization_errors.append("authorization_permitted_uses_incomplete")
+        try:
+            valid_until = date.fromisoformat(str(authorization.get("valid_until") or ""))
+            if valid_until < date.today():
+                authorization_errors.append("authorization_expired")
+        except ValueError:
+            authorization_errors.append("authorization_valid_until_invalid")
+        authorized = not authorization_errors
         pit_verified = pit.get("verified") is True and bool(pit.get("method"))
-        datasets = self.metadata.get("datasets")
-        dataset_metadata_valid = isinstance(datasets, dict) and bool(datasets) and all(
-            isinstance(value, dict) and bool(value.get("as_of")) and "required" in value for value in datasets.values())
-        ready = files_present and manifest_valid and authorized and pit_verified and dataset_metadata_valid
+        dataset_metadata_valid = not any(error.startswith("dataset") for error in contract_errors)
+        ready = files_present and manifest_valid and authorized and pit_verified and contract_valid
+        # Canonical research-gate fields are derived only from explicit bundle
+        # declarations plus verified manifest/dataset metadata.  They are not
+        # inferred from a provider name or from the presence of price files.
+        point_in_time_verified = pit_verified and manifest_valid and contract_valid
+        production_data_authorized = authorized and manifest_valid
         return {"provider": self.name, "available": files_present, "manifest_valid": manifest_valid,
                 "manifest_errors": list(errors), "authorized": authorized, "authorization_scope": authorization.get("scope"),
+                "authorization_permitted_uses": sorted(uses),
+                "authorization_errors": authorization_errors,
                 "pit_verified": pit_verified, "production_ready": ready,
+                "point_in_time_verified": point_in_time_verified,
+                "production_data_authorized": production_data_authorized,
+                "research_eligible": ready,
                 "dataset_metadata_valid": dataset_metadata_valid,
-                "reason": None if ready else "bundle requires valid hashes, explicit authorization, and PIT verification"}
+                "contract_valid": contract_valid, "contract_errors": list(contract_errors),
+                "reason": None if ready else "bundle requires complete hash-covered datasets, valid PIT records, explicit authorization, and PIT verification"}
 
     @staticmethod
     def _bool(value: str | None) -> bool:
@@ -174,18 +493,56 @@ class LicensedCsvBundleProvider(MarketDataProvider):
                     store.append(PITRecord(row["dataset"], row["entity_id"], parse_time(row["effective_at"]),
                                            parse_time(row["published_at"]), parse_time(row["available_at"]),
                                            json.loads(row.get("payload_json") or "{}"), int(row.get("revision") or 1),
-                                           row.get("source_ref", "")))
+                                           row.get("source_ref", ""), parse_time(row["collected_at"]),
+                                           row.get("parser_version", "")))
         return store
+
+    @staticmethod
+    def _record_index(store: PointInTimeStore) -> dict[tuple[str, str | None], tuple[PITRecord, ...]]:
+        grouped: dict[tuple[str, str | None], list[PITRecord]] = {}
+        for record in store.records:
+            grouped.setdefault((record.dataset, record.entity_id), []).append(record)
+            grouped.setdefault((record.dataset, None), []).append(record)
+        return {
+            key: tuple(sorted(records, key=lambda record: (record.effective_at, record.revision)))
+            for key, records in grouped.items()
+        }
+
+    @staticmethod
+    def _theme_index(store: PointInTimeStore) -> dict[str, tuple[ThemeMembership, ...]]:
+        grouped: dict[str, list[ThemeMembership]] = {}
+        for membership in store.memberships:
+            grouped.setdefault(membership.symbol, []).append(membership)
+        return {symbol: tuple(sorted(items, key=lambda item: item.effective_from))
+                for symbol, items in grouped.items()}
+
+    @staticmethod
+    def _latest_theme(index: dict[str, tuple[ThemeMembership, ...]], symbol: str,
+                      cutoff: datetime) -> str | None:
+        candidates = [item for item in index.get(symbol, ()) if item.visible_as_of(cutoff)]
+        return max(candidates, key=lambda item: item.effective_from).theme if candidates else None
+
+    @staticmethod
+    def _latest_record(index: dict[tuple[str, str | None], tuple[PITRecord, ...]], dataset: str, cutoff: datetime,
+                       entity_id: str | None = None) -> PITRecord | None:
+        candidates = [record for record in index.get((dataset, entity_id), ()) if record.visible_as_of(cutoff)]
+        return max(candidates, key=lambda record: (record.effective_at, record.revision)) if candidates else None
 
     def load(self, as_of: date | None = None) -> DataSnapshot:
         status = self.status()
         if not status["available"]: raise RuntimeError("licensed CSV bundle is incomplete")
+        if not status["contract_valid"]:
+            raise RuntimeError(f"licensed CSV bundle violates the production contract: {status['contract_errors']}")
         end = as_of or date.today(); cutoff = datetime.combine(end, time(23, 59, 59), SHANGHAI)
-        pit_store = self._load_pit(); active = {x.symbol: x for x in pit_store.universe_as_of(end)}
+        pit_store = self._load_pit(); record_index = self._record_index(pit_store); theme_index = self._theme_index(pit_store)
+        active = {x.symbol: x for x in pit_store.universe_as_of(end)}
         historical = {x.symbol: x for x in pit_store.securities}
-        bars: list[Bar] = []; visibility_fields_complete = True
+        bars: list[Bar] = []; visibility_fields_complete = True; materialization_errors: list[str] = []
         with (self.root / "bars.csv").open(encoding="utf-8-sig", newline="") as handle:
-            for row in csv.DictReader(handle):
+            raw_rows = list(csv.DictReader(handle))
+        raw_rows.sort(key=lambda row: (row.get("date", ""), row.get("symbol", "")))
+        last_action_by_symbol: dict[str, tuple] = {}
+        for row in raw_rows:
                 day = date.fromisoformat(row["date"])
                 required_times = (row.get("published_at"), row.get("effective_at"), row.get("available_at"))
                 if not all(required_times): visibility_fields_complete = False; continue
@@ -193,28 +550,113 @@ class LicensedCsvBundleProvider(MarketDataProvider):
                         parse_time(row["available_at"]) > cutoff or parse_time(row["published_at"]) > cutoff): continue
                 security = historical.get(row["symbol"])
                 if security is None or security.listed_at > day or (security.delisted_at and day >= security.delisted_at): continue
-                theme = pit_store.theme_as_of(row["symbol"], datetime.combine(day, time(23, 59, 59), SHANGHAI))
-                if theme is None: continue
+                day_cutoff = datetime.combine(day, time(23, 59, 59), SHANGHAI)
+                theme = self._latest_theme(theme_index, row["symbol"], day_cutoff)
+                financial = self._latest_record(record_index, "financials", day_cutoff, row["symbol"])
+                announcement = self._latest_record(record_index, "announcements", day_cutoff, row["symbol"])
+                corporate_action = self._latest_record(record_index, "corporate_actions", day_cutoff, row["symbol"])
+                missing_inputs = [name for name, value in (
+                    ("theme_memberships", theme), ("financials", financial),
+                    ("announcements", announcement), ("corporate_actions", corporate_action),
+                ) if value is None]
+                if missing_inputs:
+                    materialization_errors.append(
+                        f"bar_input_missing:{row['symbol']}:{day.isoformat()}:{','.join(missing_inputs)}"
+                    )
+                    continue
+                financial_payload = financial.payload
+                announcement_payload = announcement.payload
+                corporate_payload = corporate_action.payload
+                action_identity=(corporate_action.effective_at,corporate_action.revision,corporate_action.source_ref)
+                previous_action=last_action_by_symbol.get(row["symbol"])
+                action_changed=previous_action is not None and previous_action!=action_identity
+                last_action_by_symbol[row["symbol"]]=action_identity
+                adj_factor = float(corporate_payload["adj_factor"])
+                declared_adj_factor = float(row["adj_factor"])
+                if not math.isclose(adj_factor, declared_adj_factor, rel_tol=1e-9, abs_tol=1e-9):
+                    materialization_errors.append(
+                        f"adj_factor_mismatch:{row['symbol']}:{day.isoformat()}:bar={declared_adj_factor}:pit={adj_factor}"
+                    )
+                    continue
+                listed_days = int(row["listed_trading_days"])
                 bars.append(Bar(row["symbol"], security.name, day, *[float(row[x]) for x in ("open","high","low","close")],
                                 int(row["volume"]), float(row["amount"]), theme, row.get("industry", "未分类"),
-                                board=security.board, is_st=self._bool(row.get("is_st")), suspended=self._bool(row.get("suspended")),
+                                board=security.board,
+                                is_st=self._bool(row.get("is_st")) or bool(announcement_payload["is_st"]),
+                                suspended=self._bool(row.get("suspended")),
                                 limit_up=self._bool(row.get("limit_up")), limit_down=self._bool(row.get("limit_down")),
-                                listed_days=max(0, (day-security.listed_at).days), quality=float(row.get("quality", 70)),
-                                catalyst=float(row.get("catalyst", 60)), is_delisting=self._bool(row.get("is_delisting")),
-                                regulatory_risk=self._bool(row.get("regulatory_risk")), audit_abnormal=self._bool(row.get("audit_abnormal")),
-                                event_risk=self._bool(row.get("event_risk")), adj_factor=float(row.get("adj_factor",1) or 1)))
+                                listed_days=listed_days, quality=float(financial_payload["quality_score"]),
+                                catalyst=float(announcement_payload["catalyst_score"]),
+                                is_delisting=self._bool(row.get("is_delisting")) or bool(announcement_payload["is_delisting"]),
+                                regulatory_risk=self._bool(row.get("regulatory_risk")) or bool(announcement_payload["regulatory_risk"]),
+                                audit_abnormal=self._bool(row.get("audit_abnormal")) or bool(financial_payload["audit_abnormal"]),
+                                event_risk=self._bool(row.get("event_risk")) or bool(announcement_payload["event_risk"]),
+                                adj_factor=adj_factor,
+                                free_float_market_cap=float(row["free_float_market_cap"]),
+                                share_multiplier=(float(corporate_payload["share_multiplier"])
+                                                  if action_changed else 1.0),
+                                cash_dividend_per_share=(float(corporate_payload["cash_dividend_per_share"])
+                                                         if action_changed else 0.0),
+                                event_type=str(announcement_payload["event_type"]),
+                                event_date=str(announcement_payload["event_date"]),
+                                event_source_ref=str(announcement_payload["raw_text_ref"]),
+                                event_parser_version=str(announcement_payload["parser_version"])))
         if not bars: raise ValueError("bundle contains no point-in-time visible bars for requested as_of")
         latest = max(x.day for x in bars); authorization = self.metadata.get("authorization", {})
         dataset_meta = self.metadata.get("datasets", {})
-        production_ready = bool(status["production_ready"] and visibility_fields_complete)
+        market_inputs_history: dict[str, dict] = {}
+        for day in sorted({bar.day for bar in bars}):
+            day_cutoff = datetime.combine(day, time(23, 59, 59), SHANGHAI)
+            market_record = self._latest_record(record_index, "market_funding", day_cutoff)
+            global_record = self._latest_record(record_index, "global_risk", day_cutoff)
+            if market_record is None or global_record is None:
+                missing = [name for name, record in (("market_funding", market_record), ("global_risk", global_record)) if record is None]
+                materialization_errors.append(f"market_input_missing:{day.isoformat()}:{','.join(missing)}")
+                continue
+            market_inputs_history[day.isoformat()] = {
+                "fund_flow_score": float(market_record.payload["fund_flow_score"]),
+                "fund_flow_quality": "licensed_point_in_time",
+                "valuation_score": float(market_record.payload["valuation_score"]),
+                "valuation_quality": "licensed_point_in_time",
+                "global_risk_score": float(global_record.payload["global_risk_score"]),
+                "global_risk_quality": "licensed_point_in_time",
+                "market_funding_components": {
+                    key: float(market_record.payload[key]) for key in (
+                        "margin_balance", "margin_balance_change", "etf_share_change", "market_breadth"
+                    )
+                },
+                "global_risk_components": {
+                    key: float(global_record.payload[key]) for key in (
+                        "global_equity", "usd_cny", "interest_rate", "volatility_index", "commodity_index"
+                    )
+                },
+                "source": f"{market_record.source_ref};{global_record.source_ref}",
+            }
+        materialization_complete = visibility_fields_complete and not materialization_errors and bool(market_inputs_history)
+        production_ready = bool(status["production_ready"] and materialization_complete)
         visible_records = pit_store.records_as_of(cutoff)
+        current_market_inputs = market_inputs_history.get(latest.isoformat(), {})
         metadata = {"bundle": str(self.root), "batch_id": self.metadata.get("batch_id"), **status,
                     "production_ready": production_ready, "visibility_fields_complete": visibility_fields_complete,
+                    "point_in_time_verified": bool(status["point_in_time_verified"] and materialization_complete),
+                    "research_eligible": production_ready,
                     "datasets": dataset_meta, "historical_security_count": len(historical),
-                    "market_inputs": self.metadata.get("market_inputs", {}),
+                    "market_inputs": current_market_inputs, "market_inputs_history": market_inputs_history,
                     "active_security_count": len(active), "authorization": authorization,
+                    "enrichments": {
+                        "adj_factor": {"status": "available" if materialization_complete else "unavailable",
+                                       "method": "PIT corporate_actions reconciled to bars"},
+                        "financials": {"status": "available" if materialization_complete else "unavailable"},
+                        "announcements": {"status": "available" if materialization_complete else "unavailable"},
+                        "market_funding": {"status": "available" if materialization_complete else "unavailable"},
+                        "global_risk": {"status": "available" if materialization_complete else "unavailable"},
+                    },
+                    "pit_materialization": {"status": "complete" if materialization_complete else "incomplete",
+                                            "errors": sorted(set(materialization_errors)),
+                                            "market_history_days": len(market_inputs_history)},
                     "as_of_reconstruction": True, "pit_records_visible_count": len(visible_records),
-                    "pit_record_datasets": sorted({x.dataset for x in visible_records})}
+                    "pit_record_datasets": sorted({x.dataset for x in visible_records}),
+                    "pit_records_visible": [asdict(record) for record in visible_records]}
         return DataSnapshot(datetime.combine(latest, time(18), SHANGHAI), bars, self.name, len(active), metadata)
 
 
@@ -682,7 +1124,9 @@ class TushareProvider(MarketDataProvider):
         suspend_audit["suspended_without_daily"] = sorted(suspended_symbols - latest_symbols)
         matching_ready=(limit_audit.get("status")=="available" and
                         suspend_audit.get("status")=="available")
+        bars=_with_trading_day_age(bars)
         metadata = {**self.status(), "requested_as_of": end.isoformat(), "trading_days": [day.isoformat() for day in trading_days],
+                    "expected_trading_days":[day.isoformat() for day in trading_days],
                     "next_trading_day": next_trading_day.isoformat(), "trading_calendar": calendar_audit,
                     "trading_day_count": len(trading_days), "stock_basic_count": len(basic_by_symbol),
                     "skipped_unknown_symbols": skipped_unknown_symbols, "public_data": True,
@@ -1356,6 +1800,7 @@ class AkshareProvider(MarketDataProvider):
                                        # claim about the raw corporate-action factor.
                                        adj_factor=1.0))
             symbol_bars.sort(key=lambda bar: bar.day)
+            symbol_bars=_with_trading_day_age(symbol_bars,self.min_listed_days)
             if (end - listed_at).days >= 120 and len(symbol_bars) < 60:
                 raise RuntimeError(f"AKShare qfq history is too short for {symbol}; observation is blocked")
             history_counts[symbol] = len(symbol_bars)
@@ -1399,6 +1844,7 @@ class AkshareProvider(MarketDataProvider):
                     "market_inputs": market_inputs,
                     "data_quality": {"status": "observation_ready", "qfq_validated": True,
                                      "industry_complete": True, "history_counts": history_counts},
+                    "listing_age": {"unit":"observed_trading_sessions","minimum":self.min_listed_days},
                     "neutral_stock_fields": {"quality": 50.0, "catalyst": 50.0,
                                              "reason": "公开接口未提供可验证的质量与催化评分"}}
         return DataSnapshot(datetime.combine(latest, time(18), SHANGHAI), bars, self.name, len(selected_symbols), metadata)

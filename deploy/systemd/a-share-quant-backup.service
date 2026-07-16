@@ -6,5 +6,4 @@ Requires=docker.service
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/a-share-swing-quant
-ExecStart=/usr/bin/docker compose exec -T api python -m quant_system.backup --source /app/data/quant_system.db --output /app/backups --retention-days 30
-
+ExecStart=/usr/bin/docker compose exec -T api python -m quant_system.backup --source /app/data/quant_system.db --output /app/backups --retention-days 30 --artifact /app/data/research

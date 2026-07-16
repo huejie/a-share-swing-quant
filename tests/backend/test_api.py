@@ -1,5 +1,8 @@
+from datetime import date,datetime,timedelta
+from zoneinfo import ZoneInfo
 from fastapi.testclient import TestClient
-from apps.api.main import app,service
+from apps.api.main import app,qualifying_simulation_weeks,service
+from quant_system.engine import MODEL_VERSION
 
 client=TestClient(app)
 
@@ -10,13 +13,19 @@ def test_health_and_openapi():
     assert client.get("/api/v1/health/live").status_code==200
     ready=client.get("/api/v1/health/ready")
     assert ready.status_code==200 and ready.json()["checks"]["database"] is True
+    assert ready.json()["checks"]["database_schema_version"] >= 2
 
 
 def test_dashboard_pages_have_data_and_explanation():
     dashboard=client.get("/api/v1/dashboard").json()
+    assert dashboard["model_version"]==MODEL_VERSION
+    assert len(dashboard["config_hash"])==64 and len(dashboard["data_snapshot_hash"])==64
+    assert len(dashboard["candidate_audit"])==dashboard["selection_funnel"]["universe"]
     assert dashboard["model_portfolio_only"] is True
     assert dashboard["portfolio_status"] in {"healthy","partial","risk_off"} and dashboard["portfolio_reason"]
     assert dashboard["market"]["reasons"]
+    assert 3<=len(dashboard["selected_theme_names"])<=4
+    assert {item["name"] for item in dashboard["selected_themes"]}==set(dashboard["selected_theme_names"])
     assert 3<=len(dashboard["portfolio"])<=5
     position=dashboard["portfolio"][0]
     assert position["initial_weight"]==round(position["target_weight"]*.6,4)
@@ -39,7 +48,11 @@ def test_stock_detail_decision_audit_and_simulation():
 
 
 def test_settings_validation_and_backtest():
+    assert client.get("/api/v1/settings").json()["provider"]==service.provider.name
     assert client.patch("/api/v1/settings",json={"target_count":2}).status_code==422
+    assert client.patch("/api/v1/settings",json={"max_portfolio_drawdown":.181}).status_code==422
+    assert client.patch("/api/v1/settings",json={"max_adv_participation":.009}).status_code==422
+    assert client.patch("/api/v1/settings",json={"max_adv_participation":.021}).status_code==422
     assert client.patch("/api/v1/settings",json={"target_count":3,"capital":500_000}).status_code==200
     result=client.post("/api/v1/backtests",json={"capital":500_000})
     assert result.status_code==201
@@ -82,3 +95,35 @@ def test_research_run_fails_closed_on_demo_data(tmp_path,monkeypatch):
     assert client.get(f"/api/v1/research/runs/{body['id']}").status_code==200
     gates=client.get(f"/api/v1/research/runs/{body['id']}/artifacts/gates")
     assert gates.status_code==200 and gates.json()["overall"]=="FAIL"
+
+
+def test_simulation_observation_requires_dense_continuous_matching_days():
+    payload={"model_version":MODEL_VERSION,"provider":"licensed","matching_ready":True,"quality":"healthy",
+             "config_hash":"c"*64,"settings_version":7,"data_snapshot_hash":"d"*64}
+    def row(day,**changes):
+        values={**payload,**changes};return {"day":day,"recorded_at":f"{day}T18:00:00+08:00",
+                                             "config_hash":values["config_hash"],
+                                             "settings_version":values["settings_version"],
+                                             "data_snapshot_hash":values["data_snapshot_hash"],"payload":values}
+    frozen_now=datetime(2026,7,16,12,tzinfo=ZoneInfo("Asia/Shanghai"))
+    sparse=[row("2026-01-05"),row("2026-03-09")]
+    assert qualifying_simulation_weeks(sparse,MODEL_VERSION,"licensed",now=frozen_now)<8
+    assert qualifying_simulation_weeks(
+        [row("2026-01-05",matching_ready=False)],MODEL_VERSION,"licensed",now=frozen_now,
+    )==0
+
+    days=[]
+    current=date(2026,1,5)
+    while len(days)<41:
+        if current.weekday()<5:
+            days.append(row(current.isoformat(),data_snapshot_hash=f"{len(days):064x}"))
+        current+=timedelta(days=1)
+    assert qualifying_simulation_weeks(days,MODEL_VERSION,"licensed",now=frozen_now)>=8
+
+    # The same calendar span cannot be stitched across a settings/config change.
+    split=[item if index<21 else row(item["day"],config_hash="e"*64,settings_version=8,
+                                     data_snapshot_hash=item["data_snapshot_hash"])
+           for index,item in enumerate(days)]
+    assert qualifying_simulation_weeks(split,MODEL_VERSION,"licensed",now=frozen_now)<8
+    invalid=[row("2026-07-17"),{**row("2026-01-05"),"recorded_at":"2026-01-04T18:00:00+08:00"}]
+    assert qualifying_simulation_weeks(invalid,MODEL_VERSION,"licensed",now=frozen_now)==0

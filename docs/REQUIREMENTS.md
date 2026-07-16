@@ -1,8 +1,10 @@
 # A股中期波段精选系统需求规格
 
-版本：1.0  
-基线来源：`PROJECT_PLAN.md`、`.impeccable.md`  
+版本：1.1
+基线来源：`PROJECT_PLAN.md`、`.impeccable.md`
 适用范围：MVP（研究、回测、每日建议、模拟组合）；明确排除自动交易
+
+当前验收基线为 `swing-rules-0.4.0` 工程候选版。需求本身不因工程进度而降级；各组的真实 `PASS / PARTIAL / FAIL` 及证据缺口统一记录在 `tests/QA_REPORT.md`。公开 AKShare 数据不具备生产授权与历史 PIT 证明，不能用于把 DAT、BT 或正式发布门禁判为通过。
 
 ## 1. 产品目标与术语
 

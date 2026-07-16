@@ -75,6 +75,10 @@ def test_hard_risk_is_exempt_and_risk_off_can_exit_all(tmp_path):
     empty,audit=service._buffered_portfolio(snap,riskoff,stocks)
     assert empty==[] and audit["exception"]=="risk_off"
     assert len(audit["replaced"])==len(OLD)
+    actions=service._exit_actions(snap,stocks,audit)
+    assert {item["symbol"] for item in actions}==set(OLD)
+    assert all(item["action"]=="退出" and item["target_weight"]==0 for item in actions)
+    assert all(item["exit_priority"]==3 for item in actions)
 
 
 def test_trailing_profit_exit_cannot_be_reselected_in_the_same_eod_run(tmp_path):
@@ -107,3 +111,23 @@ def test_configured_portfolio_drawdown_hard_stop_exits_to_cash(tmp_path):
     assert portfolio==[]
     assert {item["symbol"] for item in risk_exits}==set(OLD)
     assert all("15%" in item["reason"] for item in risk_exits)
+
+
+def test_retained_position_prices_follow_verified_adjustment_factor_change(tmp_path):
+    service,snap,market,stocks=context(tmp_path)
+    previous=prior(symbols=[OLD[0]])
+    previous["snapshot"]["portfolio"][0].update({
+        "entry_price":100.0,"highest_price":110.0,"initial_stop":90.0,
+        "protective_price":None,"reference_adj_factor":1.0,
+        "entry_at":"2026-06-01T09:30:00+08:00",
+    })
+    snap.bars=[replace(bar,adj_factor=2.0) if bar.symbol==OLD[0] else bar for bar in snap.bars]
+    themes=assess_themes(snap);stocks=assess_stocks(snap,themes)
+    service.decisions=[previous]
+
+    portfolio,_=service._buffered_portfolio(snap,market,stocks)
+    retained=next(item for item in portfolio if item.symbol==OLD[0])
+
+    assert retained.entry_price==50.0
+    assert retained.initial_stop==45.0
+    assert retained.reference_adj_factor==2.0

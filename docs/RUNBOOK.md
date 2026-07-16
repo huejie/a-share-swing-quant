@@ -1,6 +1,6 @@
 # 本地运行与日终运维手册
 
-本文描述当前仓库已经实现的 Windows 本地运行、日终、备份和恢复验证流程。命令入口统一位于 `scripts/`。
+本文描述当前仓库已经实现的 Windows 本地运行，以及 Linux 日终、备份和恢复验证流程。Windows 命令入口统一位于 `scripts/`，Linux 定时任务位于 `deploy/systemd/`。
 
 ## 1. 前置条件
 
@@ -56,15 +56,15 @@ $env:QUANT_TUSHARE_MIN_REQUEST_INTERVAL_SECONDS = "1.25"
 
 1. 读取交易日历，确定 `trade_date`；非交易日正常退出，不复制建议冒充新建议。
 2. 采集日线、证券状态、复权/公司行为、指数/广度、题材/财务/公告、资金代理及全球风险。
-3. 冻结原始数据批次，生成 `data_snapshot_id`。
+3. 冻结完整原始策略输入，生成稳定内容哈希 `data_snapshot_hash`，并把压缩输入快照写入独立审计存储。
 4. 执行 DAT-007 质量门禁；关键失败则停止发布。
 5. 生成特征并运行市场→题材→个股→组合→风险。
 6. 校验组合不变量：数量、权重、题材、产业链、现金、容量、保护价。
-7. 追加写决策快照并原子发布；记录 `decision_id/model_version/run_id`。当前实现使用 stdlib SQLite，默认路径 `data/quant_system.db`，可由 `QUANT_DB_PATH` 改写。
+7. 追加写决策快照并原子发布；记录 `decision_id/model_version/config_hash/data_snapshot_hash/run_id`、全部候选过滤原因和核心题材。当前实现使用 stdlib SQLite，默认路径 `data/quant_system.db`，可由 `QUANT_DB_PATH` 改写。
 8. 将决策作为下一可成交日的模拟意图，绝不发真实订单。
-9. 更新前端缓存/报告并发送成功或降级通知。
+9. 更新前端与报告；若已配置通知通道，则记录并发送成功、风险或降级事件，通知失败不得伪装成日终成功。
 
-当前 CLI 根据 provider、日期、模型和组合配置稳定计算 run key；同日期同配置重跑不会产生第二份模拟意图。执行：
+当前 CLI 根据 provider、日期、模型、完整组合配置和输入快照内容稳定计算 run key；同日期、同配置、同输入重跑不会产生第二份模拟意图，配置或输入数据变化则必须生成不同 run key。执行：
 
 ```powershell
 .\scripts\eod.ps1 -AsOf 2026-07-03
@@ -113,13 +113,19 @@ $env:QUANT_TUSHARE_MIN_REQUEST_INTERVAL_SECONDS = "1.25"
 
 立即暂停应用新模拟意图；保存原始台账，禁止手工改余额。检查重复幂等键、公司行为、费用、价格精度和部分成交；通过补偿事件纠正，不能修改历史事件。
 
-## 6. 回测运行
+## 6. 通知与告警
+
+通知默认渠道为 `none`，此时事件仍以 `skipped` 状态进入 SQLite 发件箱，便于证明日终和风险事件是否发生。外部目标与凭据只能配置在进程环境或服务器权限为 `0600` 的 `.env`：Webhook 使用 `QUANT_NOTIFICATION_WEBHOOK_URL`；邮件使用 `QUANT_NOTIFICATION_SMTP_HOST/PORT/STARTTLS/USERNAME/PASSWORD` 与 `QUANT_NOTIFICATION_EMAIL_FROM/TO`。这些值不得通过设置 API 传递。
+
+管理员可通过 `GET /api/v1/notifications` 检查 `pending/sending/sent/failed/skipped`，仅对 `failed` 记录调用 `POST /api/v1/notifications/{id}/retry`。投递失败只记录封闭错误码，不记录远端响应、地址、用户名或密码，也不会回滚已完成的日终决策。渠道配置完成后，在设置页启用日终成功、风险告警并选择 `email` 或 `webhook`。
+
+## 7. 回测运行
 
 1. 冻结数据 snapshot、特征/模型版本、配置、成本模型、seed 和样本切分。
 2. 先跑小 fixture 回归，再跑完整研究。
 3. 调参只看训练/验证区间；冻结后才运行最终隔离测试集。
 4. 同时生成三基线、四资金档、敏感性、消融和压力结果。
-5. 产出 `manifest` 与 `gates`；任一硬门槛失败时 UI 显示“不通过”。
+5. 产出 `manifest`、`gates`、成交台账、净值曲线、绩效、归因和可复现运行配置；任一硬门槛失败时 UI 显示“不通过”。
 6. 不删除失败实验，不用新参数覆盖旧模型版本。
 
 研究服务对最终测试隔离采取失败关闭：参数敏感性和因子消融只能接收截止验证期末的受限快照；该快照不转发原快照 `metadata`，防止其中的最终测试基线或全期市场输入泄漏。研究报告的 `parameter_experiment_scope` 必须满足 `end < final_test.start` 且 `overlaps_final_test=false`，然后才可在冻结参数后执行最终测试。
@@ -145,7 +151,7 @@ $env:QUANT_TUSHARE_MIN_REQUEST_INTERVAL_SECONDS = "1.25"
 
 长任务失败可从已验证 checkpoint 重启，但 checkpoint 必须绑定 snapshot/config hash。不得把不同数据或配置的片段拼成一个报告。
 
-## 7. 模拟盘运行
+## 8. 模拟盘运行
 
 - 每个交易日先处理此前意图在当日是否可成交，再按收盘后新决策生成下一交易日意图。
 - 处理停牌、涨跌停、成交量上限、100 股取整、费用、滑点、部分成交和拒绝。
@@ -153,7 +159,7 @@ $env:QUANT_TUSHARE_MIN_REQUEST_INTERVAL_SECONDS = "1.25"
 - 每日报告回撤、风险动作、未成交及模拟与模型目标偏差。
 - 策略修改必须新建模拟账户或明确分段，不能污染连续 8～12 周观察证据。
 
-## 8. 备份、恢复与升级
+## 9. 备份、恢复与升级
 
 当前 SQLite 开启 WAL。必须使用脚本中的 SQLite 在线 backup API，不能在服务运行时只复制 `.db` 文件：
 
@@ -168,7 +174,9 @@ $backup = .\scripts\backup.ps1 -DestinationRoot D:\safe-backups
 
 建议每日备份并将备份根目录放在项目目录之外；定期执行隔离恢复演练。升级前执行 `.\scripts\test.ps1` 和备份；升级后检查 ready、代表性历史决策、模拟台账以及一次显式日期的 Demo 日终。
 
-## 9. 发布前人工巡检
+Linux 部署由 `a-share-quant-backup.timer` 每日生成数据库与研究制品清单，并由 `a-share-quant-restore-verify.timer` 每周在隔离临时目录校验 SHA-256、SQLite `PRAGMA integrity_check` 和研究归档安全解包。定时器存在不等于演练成功；发布验收必须保存最近一次 service 日志与成功时间。
+
+## 10. 发布前人工巡检
 
 - 首页能在 1 分钟内读出明日动作、仓位、原因和退出条件；
 - 模型输出、模拟持仓和真实持仓概念没有混淆；
@@ -177,7 +185,7 @@ $backup = .\scripts\backup.ps1 -DestinationRoot D:\safe-backups
 - 无自动交易入口、broker 依赖、券商密钥或保证性文案；
 - 研究门禁及真实 8～12 周模拟观察期满足后，才允许标记正式 MVP。
 
-## 10. 故障记录模板
+## 11. 故障记录模板
 
 ```text
 事件编号：

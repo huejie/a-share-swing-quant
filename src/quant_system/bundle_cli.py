@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from .pit import RawBatchManifest
 from .providers import LicensedCsvBundleProvider
 
-REQUIRED = ("bars.csv", "securities.csv", "theme_memberships.csv", "metadata.json")
+REQUIRED = ("bars.csv", "securities.csv", "theme_memberships.csv", "pit_records.csv", "metadata.json")
 
 
 def _read_declared_metadata(root: Path) -> dict:
@@ -32,13 +32,20 @@ def _read_declared_metadata(root: Path) -> dict:
     invalid_datasets = [name for name, value in metadata["datasets"].items()
                         if not isinstance(value, dict) or not value.get("as_of") or "required" not in value]
     if invalid_datasets: raise ValueError(f"dataset metadata requires as_of and required: {', '.join(invalid_datasets)}")
+    missing_datasets = sorted(set(LicensedCsvBundleProvider.required_datasets) - set(metadata["datasets"]))
+    if missing_datasets:
+        raise ValueError(f"metadata.datasets is missing production datasets: {', '.join(missing_datasets)}")
+    not_required = sorted(name for name in LicensedCsvBundleProvider.required_datasets
+                          if metadata["datasets"][name].get("required") is not True)
+    if not_required:
+        raise ValueError(f"production datasets must declare required=true: {', '.join(not_required)}")
     return {k: v for k, v in metadata.items() if k != "manifest"}
 
 
 def build_bundle(input_dir: str | Path, output_dir: str | Path | None = None) -> dict:
     source = Path(input_dir).resolve(); target = Path(output_dir).resolve() if output_dir else source
     declared = _read_declared_metadata(source)
-    files = [name for name in ("bars.csv", "securities.csv", "theme_memberships.csv", "pit_records.csv") if (source / name).is_file()]
+    files = list(LicensedCsvBundleProvider.required_files)
     target.mkdir(parents=True, exist_ok=True)
     if target != source:
         for name in files: shutil.copy2(source / name, target / name)

@@ -1,0 +1,9 @@
+[Unit]
+Description=Verify latest A-share quant backup in an isolated restore directory
+After=a-share-quant-backup.service docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/a-share-swing-quant
+ExecStart=/usr/bin/docker compose exec -T api python -m quant_system.backup_verify --input /app/backups

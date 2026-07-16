@@ -22,6 +22,26 @@ def test_scoring_and_small_portfolio_constraints():
     assert themes==sorted(themes,key=lambda x:x.score,reverse=True)
 
 
+def test_capacity_gate_uses_configured_one_to_two_percent_adv_limit():
+    snap=DeterministicDemoProvider().load()
+    symbol=snap.bars[0].symbol
+    bounded=replace(
+        snap,
+        bars=[replace(bar,amount=100_000_000) if bar.symbol==symbol else bar for bar in snap.bars],
+    )
+    themes=assess_themes(bounded)
+    loose={item.symbol:item for item in assess_stocks(
+        bounded,themes,capital=10_000_000,max_adv_participation=.02,
+    )}
+    strict={item.symbol:item for item in assess_stocks(
+        bounded,themes,capital=10_000_000,max_adv_participation=.01,
+    )}
+
+    assert loose[symbol].gate_results["capacity"]["passed"] is True
+    assert strict[symbol].gate_results["capacity"]["passed"] is False
+    assert "1%" in strict[symbol].gate_results["capacity"]["reason"]
+
+
 def test_all_main_board_public_watchlist_degrades_to_balanced_style_without_crashing():
     snap=DeterministicDemoProvider().load(date(2026,7,3))
     main_only=replace(snap,bars=[replace(bar,board="主板") for bar in snap.bars])
@@ -49,6 +69,26 @@ def test_explicit_public_grouping_supports_diversified_three_to_five_name_portfo
     assert all(position.theme!="未配置" for position in portfolio)
     by_symbol={stock.symbol:stock for stock in stocks}
     assert all(by_symbol[position.symbol].industry!="未配置" for position in portfolio)
+
+
+def test_industry_chain_cap_never_scales_a_position_below_fifteen_percent():
+    snap=DeterministicDemoProvider().load(date(2026,7,3))
+    symbols=sorted({bar.symbol for bar in snap.bars})
+    themes={symbol:f"题材-{index % 4}" for index,symbol in enumerate(symbols)}
+    same_chain=replace(snap,bars=[replace(bar,theme=themes[bar.symbol],industry="同一产业链") for bar in snap.bars])
+    market=replace(assess_market(same_chain),exposure_cap=.90)
+    stocks=assess_stocks(same_chain,assess_themes(same_chain))
+
+    portfolio=build_portfolio(
+        same_chain,market,stocks,target_count=4,
+        allow_low_score_symbols={stock.symbol for stock in stocks},
+    )
+
+    # Four 15% positions cannot fit inside one 45% chain.  Keep three valid
+    # positions and cash instead of returning the old 4 x 11.25% workaround.
+    assert len(portfolio)==3
+    assert all(.15<=position.target_weight<=.25 for position in portfolio)
+    assert sum(position.target_weight for position in portfolio)<=.45
 
 
 def test_adjustment_factor_removes_false_corporate_action_return_and_keeps_latest_price():
@@ -84,6 +124,18 @@ def test_profit_giveback_stop_activates_only_after_15_percent():
 def test_hard_risk_has_exit_priority_over_price_stop():
     decision=evaluate_exit(entry=100,peak=110,close=80,initial_stop=90,holding_days=20,hard_risk=True)
     assert decision.priority==1
+
+
+def test_time_exit_starts_at_40_trading_days_only_without_excess_return():
+    assert not evaluate_exit(entry=100,peak=110,close=105,initial_stop=90,
+                             holding_days=39,excess_return=-.01).should_exit
+    weak=evaluate_exit(entry=100,peak=110,close=105,initial_stop=90,
+                       holding_days=40,excess_return=0)
+    assert weak.should_exit and weak.priority==7 and "无超额收益" in weak.reason
+    assert not evaluate_exit(entry=100,peak=110,close=105,initial_stop=90,
+                             holding_days=60,excess_return=.01).should_exit
+    assert evaluate_exit(entry=100,peak=110,close=105,initial_stop=90,
+                         holding_days=80,excess_return=.01).should_exit
 
 
 def test_capacity_can_exclude_stock_for_large_account():

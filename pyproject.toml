@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "a-share-swing-quant"
-version = "0.1.0"
+version = "0.4.0"
 description = "Explainable A-share medium-term model portfolio"
 requires-python = ">=3.11"
 dependencies = [
@@ -27,6 +27,6 @@ quant-validate-bundle = "quant_system.bundle_cli:validate_main"
 packages = ["src/quant_system"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests/backend"]
+testpaths = ["tests"]
 pythonpath = ["src", "."]
 addopts = "-q"

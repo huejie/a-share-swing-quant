@@ -1,12 +1,15 @@
 {
   "name": "a-share-swing-web",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.4.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "tsc -b && vite build",
-    "test": "vitest run"
+    "test": "vitest run --exclude e2e/**",
+    "pretest:e2e": "node e2e/clean-runtime.mjs",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "npm run pretest:e2e && playwright test --headed"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
@@ -17,6 +20,8 @@
     "vite": "latest"
   },
   "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
+    "@playwright/test": "^1.61.1",
     "@testing-library/jest-dom": "latest",
     "@testing-library/react": "latest",
     "@types/node": "^26.1.0",

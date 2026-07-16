@@ -36,9 +36,23 @@ function Get-RelativePathCompat {
         [Parameter(Mandatory=$true)][string]$BasePath,
         [Parameter(Mandatory=$true)][string]$ChildPath
     )
-    $baseFull = [IO.Path]::GetFullPath($BasePath).TrimEnd('\') + '\'
+    $baseFull = [IO.Path]::GetFullPath($BasePath)
     $childFull = [IO.Path]::GetFullPath($ChildPath)
+
+    # PowerShell 7 / .NET Core provides a native cross-platform implementation.
+    # Detect it by reflection so Windows PowerShell 5.1 never tries to bind a
+    # method that does not exist on .NET Framework.
+    $relativeMethod = [IO.Path].GetMethods() |
+        Where-Object { $_.Name -eq 'GetRelativePath' -and $_.GetParameters().Count -eq 2 } |
+        Select-Object -First 1
+    if ($null -ne $relativeMethod) {
+        return $relativeMethod.Invoke($null, @($baseFull, $childFull))
+    }
+    $separator = [IO.Path]::DirectorySeparatorChar
+    $trimChars = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+    $baseFull = $baseFull.TrimEnd($trimChars) + $separator
     $baseUri = [Uri]$baseFull
     $childUri = [Uri]$childFull
-    return [Uri]::UnescapeDataString($baseUri.MakeRelativeUri($childUri).ToString()).Replace('/', '\')
+    $relative = [Uri]::UnescapeDataString($baseUri.MakeRelativeUri($childUri).ToString())
+    return $relative.Replace([char]'/', [IO.Path]::DirectorySeparatorChar)
 }

@@ -38,21 +38,28 @@ function Get-RelativePathCompat {
     )
     $baseFull = [IO.Path]::GetFullPath($BasePath)
     $childFull = [IO.Path]::GetFullPath($ChildPath)
-
-    # PowerShell 7 / .NET Core provides a native cross-platform implementation.
-    # Detect it by reflection so Windows PowerShell 5.1 never tries to bind a
-    # method that does not exist on .NET Framework.
-    $relativeMethod = [IO.Path].GetMethods() |
-        Where-Object { $_.Name -eq 'GetRelativePath' -and $_.GetParameters().Count -eq 2 } |
-        Select-Object -First 1
-    if ($null -ne $relativeMethod) {
-        return $relativeMethod.Invoke($null, @($baseFull, $childFull))
-    }
     $separator = [IO.Path]::DirectorySeparatorChar
     $trimChars = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
-    $baseFull = $baseFull.TrimEnd($trimChars) + $separator
-    $baseUri = [Uri]$baseFull
-    $childUri = [Uri]$childFull
-    $relative = [Uri]::UnescapeDataString($baseUri.MakeRelativeUri($childUri).ToString())
-    return $relative.Replace([char]'/', [IO.Path]::DirectorySeparatorChar)
+    $baseRoot = [IO.Path]::GetPathRoot($baseFull)
+    $childRoot = [IO.Path]::GetPathRoot($childFull)
+    $isWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+    $comparison = if ($isWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    if (-not [string]::Equals($baseRoot, $childRoot, $comparison)) {
+        throw "Paths are on different roots: $baseRoot and $childRoot"
+    }
+
+    $baseRemainder = $baseFull.Substring($baseRoot.Length).Trim($trimChars)
+    $childRemainder = $childFull.Substring($childRoot.Length).Trim($trimChars)
+    $baseParts = if ($baseRemainder) { @($baseRemainder.Split($trimChars, [StringSplitOptions]::RemoveEmptyEntries)) } else { @() }
+    $childParts = if ($childRemainder) { @($childRemainder.Split($trimChars, [StringSplitOptions]::RemoveEmptyEntries)) } else { @() }
+    $common = 0
+    while ($common -lt $baseParts.Count -and $common -lt $childParts.Count -and
+           [string]::Equals($baseParts[$common], $childParts[$common], $comparison)) {
+        $common++
+    }
+    $segments = @()
+    for ($index = $common; $index -lt $baseParts.Count; $index++) { $segments += '..' }
+    for ($index = $common; $index -lt $childParts.Count; $index++) { $segments += $childParts[$index] }
+    if ($segments.Count -eq 0) { return '.' }
+    return ($segments -join $separator)
 }

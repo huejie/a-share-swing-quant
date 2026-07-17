@@ -367,6 +367,7 @@ class QuantService:
             blocked={"published":False,"run_key":run_key,"model_version":MODEL_VERSION,
                      "config_version":self.settings_version,"config_hash":config_hash,
                      "data_snapshot_hash":data_snapshot_hash,"quality":jsonable(q),
+                     "as_of":self.snapshot.as_of.isoformat(),"provider":self.snapshot.provider,
                      "message":"数据质量门禁未通过，保留上一版建议并标记过期",
                      "last_published":self.latest,"simulation":{"matched":matched,"valuation":valuation}}
             self.repository.save_run(run_key,"blocked",blocked)
